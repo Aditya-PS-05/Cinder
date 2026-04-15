@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "Proprietary"
+publish = false
+authors = ["Arcane Labs"]
+
+[workspace.dependencies]
+# ---- error handling ----
+thiserror = "1"
+anyhow = "1"
+
+# ---- serialization ----
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+serde_json = "1"
+
+# ---- internal crates ----
+ts-core = { path = "crates/core" }
+ts-config = { path = "crates/config" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1          # line-table only, keeps binary debuggable without bloat
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+debug = 1

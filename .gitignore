@@ -1,0 +1,33 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.vault/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local data
+data/
+tmp/
+*.log
+
+# Docker volumes (if mounted into repo)
+.volumes/
+
+# OMC tooling state (keep config but ignore caches)
+.omc/cache/
+.omc/state/
+
+todo.md

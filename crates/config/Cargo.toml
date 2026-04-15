@@ -1,0 +1,13 @@
+[package]
+name = "ts-config"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Layered YAML configuration loader with env-var overrides."
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }

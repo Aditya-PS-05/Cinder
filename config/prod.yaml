@@ -1,0 +1,23 @@
+service:
+  log_level: info
+
+postgres:
+  host: pg.prod.internal
+  password: ""  # injected via TS_POSTGRES_PASSWORD
+  max_open_conns: 100
+  max_idle_conns: 20
+
+redis:
+  addr: redis.prod.internal:6379
+  pool_size: 200
+
+clickhouse:
+  addr: ch.prod.internal:9000
+
+observability:
+  tracing_sample_rate: 0.05
+
+risk:
+  kill_switch_enabled: true
+  max_daily_loss_usd: 25000
+  max_position_notional_usd: 250000

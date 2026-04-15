@@ -1,0 +1,10 @@
+[package]
+name = "ts-core"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared primitives used across every trading-system service."
+
+[dependencies]

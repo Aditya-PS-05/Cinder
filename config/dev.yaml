@@ -1,0 +1,9 @@
+service:
+  log_level: debug
+
+observability:
+  tracing_sample_rate: 1.0
+
+risk:
+  max_daily_loss_usd: 50
+  max_position_notional_usd: 200

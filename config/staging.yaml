@@ -1,0 +1,19 @@
+service:
+  log_level: info
+
+postgres:
+  host: pg.staging.internal
+  password: ""  # injected via TS_POSTGRES_PASSWORD
+
+redis:
+  addr: redis.staging.internal:6379
+
+clickhouse:
+  addr: ch.staging.internal:9000
+
+observability:
+  tracing_sample_rate: 0.5
+
+risk:
+  max_daily_loss_usd: 250
+  max_position_notional_usd: 1000

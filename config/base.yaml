@@ -1,0 +1,44 @@
+# Base configuration shared by every environment.
+# Environment overlays in dev.yaml / staging.yaml / prod.yaml replace
+# matching keys. Process env vars of the form TS_<UPPER_DOTTED_PATH>
+# override anything from disk.
+
+service:
+  name: trading-system
+  log_level: info
+  log_format: json
+
+postgres:
+  host: localhost
+  port: 5432
+  user: trading
+  password: trading
+  database: trading
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 30m
+
+redis:
+  addr: localhost:6379
+  db: 0
+  pool_size: 50
+
+clickhouse:
+  addr: localhost:9000
+  database: trading
+  username: default
+  password: ""
+
+nats:
+  url: nats://localhost:4222
+  cluster_id: trading-local
+
+observability:
+  metrics_addr: :9090
+  tracing_endpoint: ""
+  tracing_sample_rate: 0.05
+
+risk:
+  kill_switch_enabled: true
+  max_daily_loss_usd: 1000
+  max_position_notional_usd: 5000
