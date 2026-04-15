@@ -1,0 +1,110 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776240374027,
+  "projectRoot": "/home/aditya/my-work/something/trading-system",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": "1.75",
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      },
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cargo test",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "config": {
+      "path": "config",
+      "purpose": "Configuration files",
+      "fileCount": 4,
+      "lastAccessed": 1776240374023,
+      "keyFiles": [
+        "base.yaml",
+        "dev.yaml",
+        "prod.yaml",
+        "staging.yaml"
+      ]
+    },
+    "crates": {
+      "path": "crates",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776240374025,
+      "keyFiles": []
+    },
+    "infra": {
+      "path": "infra",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776240374025,
+      "keyFiles": []
+    },
+    "ops": {
+      "path": "ops",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776240374025,
+      "keyFiles": []
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1776240374025,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    },
+    "crates/config": {
+      "path": "crates/config",
+      "purpose": "Configuration files",
+      "fileCount": 1,
+      "lastAccessed": 1776240374026,
+      "keyFiles": [
+        "Cargo.toml"
+      ]
+    },
+    "infra/migrations": {
+      "path": "infra/migrations",
+      "purpose": "Database migrations",
+      "fileCount": 0,
+      "lastAccessed": 1776240374026,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}
