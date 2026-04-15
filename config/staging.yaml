@@ -10,6 +10,7 @@ redis:
 
 clickhouse:
   addr: ch.staging.internal:9000
+  http_url: http://ch.staging.internal:8123
 
 observability:
   tracing_sample_rate: 0.5

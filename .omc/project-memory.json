@@ -105,6 +105,169 @@
       "keyFiles": []
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "Cargo.toml",
+      "accessCount": 2,
+      "lastAccessed": 1776241168945,
+      "type": "file"
+    },
+    {
+      "path": "config/base.yaml",
+      "accessCount": 2,
+      "lastAccessed": 1776241639867,
+      "type": "file"
+    },
+    {
+      "path": "crates/config/tests/real_configs.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776241641763,
+      "type": "file"
+    },
+    {
+      "path": "config/staging.yaml",
+      "accessCount": 2,
+      "lastAccessed": 1776241649906,
+      "type": "file"
+    },
+    {
+      "path": "config/prod.yaml",
+      "accessCount": 2,
+      "lastAccessed": 1776241650990,
+      "type": "file"
+    },
+    {
+      "path": "Makefile",
+      "accessCount": 2,
+      "lastAccessed": 1776241668064,
+      "type": "file"
+    },
+    {
+      "path": "infra/compose/docker-compose.yml",
+      "accessCount": 1,
+      "lastAccessed": 1776241028296,
+      "type": "file"
+    },
+    {
+      "path": "crates/config/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241118682,
+      "type": "file"
+    },
+    {
+      "path": "config/dev.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1776241128664,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1776241458700,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241463064,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/error.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241468088,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/config.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241472292,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/migrate.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241486335,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/postgres.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241503397,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/postgres/migrate.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241517102,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/clickhouse.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241533243,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/clickhouse/migrate.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241544828,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/bin/ts_migrate.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776241568863,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/postgres/V001__instruments_and_accounts.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241582084,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/postgres/V002__orders_and_fills.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241594932,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/postgres/V003__positions_balances_audit.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241602994,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/clickhouse/V001__trades.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241613800,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/clickhouse/V002__book_snapshots.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241619206,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/clickhouse/V003__book_deltas.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241623809,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/clickhouse/V004__fundings.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241627444,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/clickhouse/V005__liquidations.sql",
+      "accessCount": 1,
+      "lastAccessed": 1776241630225,
+      "type": "file"
+    }
+  ],
   "userDirectives": []
 }

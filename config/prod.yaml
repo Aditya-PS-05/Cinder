@@ -13,6 +13,7 @@ redis:
 
 clickhouse:
   addr: ch.prod.internal:9000
+  http_url: http://ch.prod.internal:8123
 
 observability:
   tracing_sample_rate: 0.05

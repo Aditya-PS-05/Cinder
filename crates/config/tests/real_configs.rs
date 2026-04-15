@@ -51,6 +51,7 @@ struct Redis {
 #[allow(dead_code)]
 struct ClickHouse {
     addr: String,
+    http_url: String,
     database: String,
     username: String,
     password: String,

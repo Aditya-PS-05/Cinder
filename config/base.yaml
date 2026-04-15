@@ -25,6 +25,7 @@ redis:
 
 clickhouse:
   addr: localhost:9000
+  http_url: http://localhost:8123
   database: trading
   username: default
   password: ""

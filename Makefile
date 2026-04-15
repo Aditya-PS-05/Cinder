@@ -64,6 +64,22 @@ ps: ## Show local infra status
 logs: ## Tail local infra logs
 	docker compose -f $(COMPOSE_FILE) logs -f --tail=100
 
+# ---------- Schema migrations ----------
+
+TS_ENV ?= dev
+
+.PHONY: migrate
+migrate: ## Apply pending Postgres + ClickHouse migrations (TS_ENV=dev)
+	cargo run -q -p ts-storage --bin ts-migrate -- --env $(TS_ENV) up
+
+.PHONY: migrate-status
+migrate-status: ## Print applied migrations on both backends
+	cargo run -q -p ts-storage --bin ts-migrate -- --env $(TS_ENV) status
+
+.PHONY: migrate-validate
+migrate-validate: ## Parse on-disk migrations and print checksums (no network)
+	cargo run -q -p ts-storage --bin ts-migrate -- --env $(TS_ENV) validate
+
 # ---------- Quality gate ----------
 
 .PHONY: ci
