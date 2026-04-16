@@ -26,6 +26,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod order_engine;
+
 use std::collections::HashMap;
 
 use ts_book::{BookError, OrderBook};
@@ -37,6 +39,8 @@ use ts_paper::PaperExecutor;
 use ts_risk::RiskEngine;
 pub use ts_risk::{RiskConfig, RiskRejection};
 use ts_strategy::{is_terminal, Strategy, StrategyAction};
+
+pub use order_engine::OrderEngine;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -123,18 +127,6 @@ impl<S: Strategy> PaperEngine<S> {
         Ok(self.process_actions(actions, event.local_ts))
     }
 
-    /// Submit an order outside the strategy loop (admin / test flow).
-    /// Still flows through risk, the executor, and strategy callbacks.
-    pub fn submit(&mut self, order: NewOrder, now: Timestamp) -> ExecReport {
-        self.submit_internal(order, now)
-    }
-
-    /// Cancel a live order by cid. Emits a synthetic `Canceled` report
-    /// (or `Rejected` if the cid is unknown).
-    pub fn cancel(&mut self, cid: &ClientOrderId) -> ExecReport {
-        self.cancel_internal(cid)
-    }
-
     fn process_actions(&mut self, actions: Vec<StrategyAction>, now: Timestamp) -> EngineStep {
         let mut step = EngineStep::default();
         for action in actions {
@@ -153,7 +145,7 @@ impl<S: Strategy> PaperEngine<S> {
         step
     }
 
-    fn submit_internal(&mut self, order: NewOrder, now: Timestamp) -> ExecReport {
+    pub(crate) fn submit_internal(&mut self, order: NewOrder, now: Timestamp) -> ExecReport {
         let ref_price = match self.reference_price(&order) {
             Some(p) => p,
             None => {
@@ -184,7 +176,7 @@ impl<S: Strategy> PaperEngine<S> {
         report
     }
 
-    fn cancel_internal(&mut self, cid: &ClientOrderId) -> ExecReport {
+    pub(crate) fn cancel_internal(&mut self, cid: &ClientOrderId) -> ExecReport {
         if self.live_orders.remove(cid).is_none() {
             let r = ExecReport::rejected(cid.clone(), "cancel: unknown cid");
             self.strategy.on_exec_report(&r);
@@ -403,7 +395,9 @@ mod tests {
         ))
         .unwrap();
 
-        let report = e.submit(market_order(Side::Buy, 5), Timestamp::default());
+        let report = e
+            .submit(market_order(Side::Buy, 5), Timestamp::default())
+            .unwrap();
         assert_eq!(report.status, OrderStatus::Filled);
         assert_eq!(report.filled_qty, Qty(5));
         assert_eq!(e.risk().position(&sym()), 5);
@@ -416,7 +410,9 @@ mod tests {
         // Bids only; a buy market has no ask to reference.
         e.apply_event(&snapshot_event(vec![lvl(100, 10)], vec![], 1))
             .unwrap();
-        let report = e.submit(market_order(Side::Buy, 1), Timestamp::default());
+        let report = e
+            .submit(market_order(Side::Buy, 1), Timestamp::default())
+            .unwrap();
         assert_eq!(report.status, OrderStatus::Rejected);
         assert_eq!(e.risk().open_orders(), 0);
     }
@@ -428,7 +424,9 @@ mod tests {
         let mut e = PaperEngine::new(cfg, RiskConfig::permissive(), maker());
         e.apply_event(&snapshot_event(vec![lvl(100, 10)], vec![], 1))
             .unwrap();
-        let report = e.submit(market_order(Side::Buy, 1), Timestamp::default());
+        let report = e
+            .submit(market_order(Side::Buy, 1), Timestamp::default())
+            .unwrap();
         // Risk passes, executor finds no asks, market qty remains → Canceled.
         assert_eq!(report.status, OrderStatus::Canceled);
     }
@@ -442,7 +440,9 @@ mod tests {
             .unwrap();
 
         // 10 @ 110 = 1100 notional, well above cap of 50.
-        let report = e.submit(market_order(Side::Buy, 10), Timestamp::default());
+        let report = e
+            .submit(market_order(Side::Buy, 10), Timestamp::default())
+            .unwrap();
         assert_eq!(report.status, OrderStatus::Rejected);
         assert!(report.reason.as_deref().unwrap().contains("notional"));
         assert_eq!(e.risk().open_orders(), 0);
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn cancel_unknown_cid_rejects_without_touching_state() {
         let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), maker());
-        let report = e.cancel(&ClientOrderId::new("no-such-order"));
+        let report = e.cancel(&ClientOrderId::new("no-such-order")).unwrap();
         assert_eq!(report.status, OrderStatus::Rejected);
         assert_eq!(e.risk().open_orders(), 0);
     }
@@ -489,7 +489,9 @@ mod tests {
         };
         // The engine's strategy is private; poke inventory through a synthetic
         // fill by submitting and filling a marketable order.
-        let _ = e.submit(market_order(Side::Buy, 3), Timestamp::default());
+        let _ = e
+            .submit(market_order(Side::Buy, 3), Timestamp::default())
+            .unwrap();
         let _ = fill_for_maker; // kept to document the scenario
 
         // Tick 2: post-fill, inventory should skew quotes down by 3 ticks.

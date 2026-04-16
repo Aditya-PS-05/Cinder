@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 ts-core.workspace = true
 ts-book.workspace = true
+ts-oms.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 serde.workspace = true

@@ -18,7 +18,7 @@ use ts_book::BookError;
 use ts_core::{
     ClientOrderId, ExecReport, Fill, MarketEvent, NewOrder, OrderStatus, Price, Timestamp,
 };
-use ts_oms::{EngineStep, PaperEngine};
+use ts_oms::{EngineStep, OrderEngine, PaperEngine};
 use ts_pnl::Accountant;
 use ts_strategy::Strategy;
 
@@ -116,8 +116,12 @@ impl<S: Strategy> Replay<S> {
     /// Inject an external (non-strategy) order between market events.
     /// The resulting report is folded into metrics and accountant the
     /// same way strategy-driven orders are.
+    ///
+    /// Goes through the [`OrderEngine`] trait; `PaperEngine` never
+    /// errors here, so the inner result is `.unwrap()`ed.
     pub fn submit_taker(&mut self, order: NewOrder, now: Timestamp) -> ExecReport {
-        let report = self.engine.submit(order, now);
+        let report =
+            OrderEngine::submit(&mut self.engine, order, now).expect("PaperEngine is infallible");
         self.absorb_report(&report);
         for f in &report.fills {
             self.absorb_fill(f);
@@ -127,7 +131,7 @@ impl<S: Strategy> Replay<S> {
 
     /// Externally cancel a live order and fold the resulting report.
     pub fn cancel_taker(&mut self, cid: &ClientOrderId) -> ExecReport {
-        let report = self.engine.cancel(cid);
+        let report = OrderEngine::cancel(&mut self.engine, cid).expect("PaperEngine is infallible");
         self.absorb_report(&report);
         report
     }

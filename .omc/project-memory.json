@@ -115,14 +115,32 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 14,
-      "lastAccessed": 1776339077526,
+      "accessCount": 16,
+      "lastAccessed": 1776355200438,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/lib.rs",
+      "accessCount": 9,
+      "lastAccessed": 1776355181786,
+      "type": "file"
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "accessCount": 8,
+      "lastAccessed": 1776354798976,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/error.rs",
+      "accessCount": 8,
+      "lastAccessed": 1776354799311,
       "type": "file"
     },
     {
       "path": "crates/core/src/order.rs",
-      "accessCount": 7,
-      "lastAccessed": 1776314201773,
+      "accessCount": 8,
+      "lastAccessed": 1776354802520,
       "type": "file"
     },
     {
@@ -132,39 +150,27 @@
       "type": "file"
     },
     {
-      "path": "crates/binance/src/error.rs",
-      "accessCount": 7,
-      "lastAccessed": 1776339035884,
-      "type": "file"
-    },
-    {
-      "path": "crates/core/src/lib.rs",
-      "accessCount": 7,
-      "lastAccessed": 1776339092629,
-      "type": "file"
-    },
-    {
       "path": "crates/core/src/venue.rs",
-      "accessCount": 6,
-      "lastAccessed": 1776314148304,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/lib.rs",
-      "accessCount": 6,
-      "lastAccessed": 1776339137055,
+      "accessCount": 7,
+      "lastAccessed": 1776354802952,
       "type": "file"
     },
     {
       "path": "crates/binance/Cargo.toml",
-      "accessCount": 5,
-      "lastAccessed": 1776339047190,
+      "accessCount": 7,
+      "lastAccessed": 1776355197572,
       "type": "file"
     },
     {
       "path": "crates/binance/src/spot.rs",
       "accessCount": 4,
       "lastAccessed": 1776313593913,
+      "type": "file"
+    },
+    {
+      "path": "crates/core/src/decimal.rs",
+      "accessCount": 4,
+      "lastAccessed": 1776354803252,
       "type": "file"
     },
     {
@@ -177,12 +183,6 @@
       "path": "crates/storage/src/lib.rs",
       "accessCount": 3,
       "lastAccessed": 1776314051084,
-      "type": "file"
-    },
-    {
-      "path": "crates/core/src/decimal.rs",
-      "accessCount": 3,
-      "lastAccessed": 1776314112906,
       "type": "file"
     },
     {

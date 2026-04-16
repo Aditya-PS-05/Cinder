@@ -17,12 +17,14 @@
 pub mod book;
 pub mod decode;
 pub mod error;
+pub mod live_engine;
 pub mod order_rest;
 pub mod rest;
 pub mod spot;
 
 pub use book::{BinanceBookSync, BookUpdate, SyncState};
 pub use error::BinanceError;
+pub use live_engine::{BinanceLiveEngine, BinanceOrderApi, LiveEngineError};
 pub use order_rest::{
     AccountSummary, Balance, CancelOrderRequest, NewOrderRequest, OrderAck, OrderSelector,
     OrderType, QueryOrderRequest, Side, SignedClient, TimeInForce, MAINNET_BASE, TESTNET_BASE,

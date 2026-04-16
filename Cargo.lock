@@ -2005,6 +2005,7 @@ dependencies = [
  "tracing-subscriber",
  "ts-book",
  "ts-core",
+ "ts-oms",
 ]
 
 [[package]]
