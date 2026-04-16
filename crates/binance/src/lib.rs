@@ -21,6 +21,7 @@ pub mod live_engine;
 pub mod order_rest;
 pub mod rest;
 pub mod spot;
+pub mod user_stream;
 
 pub use book::{BinanceBookSync, BookUpdate, SyncState};
 pub use error::BinanceError;
@@ -31,3 +32,7 @@ pub use order_rest::{
 };
 pub use rest::{fetch_depth_snapshot, parse_depth_snapshot, DepthSnapshot};
 pub use spot::{SpotStreamClient, SpotStreamConfig};
+pub use user_stream::{
+    decode_execution_report, decode_user_stream_frame, UserDataStreamClient, UserDataStreamConfig,
+    UserStreamEvent, MAINNET_USER_WS_BASE, TESTNET_USER_WS_BASE,
+};

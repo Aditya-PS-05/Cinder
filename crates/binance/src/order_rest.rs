@@ -105,6 +105,79 @@ impl SignedClient {
             .await
     }
 
+    /// Request a fresh user-data-stream `listenKey`. Unsigned (API key
+    /// header only); the key expires 60 minutes after creation unless
+    /// refreshed with [`keepalive_listen_key`](Self::keepalive_listen_key).
+    pub async fn create_listen_key(&self) -> Result<String, BinanceError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "listenKey")]
+            listen_key: String,
+        }
+        let resp: Resp = self
+            .send_keyed(Method::POST, "/api/v3/userDataStream", &[])
+            .await?;
+        Ok(resp.listen_key)
+    }
+
+    /// Extend a listenKey's validity by 60 minutes. Binance expects a
+    /// keepalive every 30 minutes to stay well clear of expiry.
+    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<(), BinanceError> {
+        let _: serde_json::Value = self
+            .send_keyed(
+                Method::PUT,
+                "/api/v3/userDataStream",
+                &[("listenKey", listen_key)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Close a listenKey, ending the user-data-stream on Binance's side.
+    pub async fn close_listen_key(&self, listen_key: &str) -> Result<(), BinanceError> {
+        let _: serde_json::Value = self
+            .send_keyed(
+                Method::DELETE,
+                "/api/v3/userDataStream",
+                &[("listenKey", listen_key)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// API-key-authenticated but unsigned request — used by endpoints
+    /// like the listenKey lifecycle that don't require HMAC.
+    pub(crate) async fn send_keyed<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        params: &[(&'static str, &str)],
+    ) -> Result<T, BinanceError> {
+        let base = self.base_url.trim_end_matches('/');
+        let url = if params.is_empty() {
+            format!("{base}{path}")
+        } else {
+            let owned: Vec<(&'static str, String)> =
+                params.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+            format!("{base}{path}?{}", build_query(&owned))
+        };
+        let resp = self
+            .http
+            .request(method, &url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        let bytes = resp.bytes().await?;
+        if !status.is_success() {
+            return Err(BinanceError::RestStatus {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        serde_json::from_slice(&bytes).map_err(Into::into)
+    }
+
     async fn send_signed<T: for<'de> Deserialize<'de>>(
         &self,
         method: Method,
