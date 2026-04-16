@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1776240374027,
+  "lastScanned": 1776338994064,
   "projectRoot": "/home/aditya/my-work/something/trading-system",
   "techStack": {
     "languages": [
@@ -50,7 +50,7 @@
       "path": "config",
       "purpose": "Configuration files",
       "fileCount": 4,
-      "lastAccessed": 1776240374023,
+      "lastAccessed": 1776338994056,
       "keyFiles": [
         "base.yaml",
         "dev.yaml",
@@ -58,32 +58,39 @@
         "staging.yaml"
       ]
     },
+    "configs": {
+      "path": "configs",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776338994060,
+      "keyFiles": []
+    },
     "crates": {
       "path": "crates",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776240374025,
+      "lastAccessed": 1776338994061,
       "keyFiles": []
     },
     "infra": {
       "path": "infra",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776240374025,
+      "lastAccessed": 1776338994061,
       "keyFiles": []
     },
     "ops": {
       "path": "ops",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776240374025,
+      "lastAccessed": 1776338994062,
       "keyFiles": []
     },
     "target": {
       "path": "target",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1776240374025,
+      "lastAccessed": 1776338994062,
       "keyFiles": [
         "CACHEDIR.TAG"
       ]
@@ -92,7 +99,7 @@
       "path": "crates/config",
       "purpose": "Configuration files",
       "fileCount": 1,
-      "lastAccessed": 1776240374026,
+      "lastAccessed": 1776338994063,
       "keyFiles": [
         "Cargo.toml"
       ]
@@ -101,15 +108,15 @@
       "path": "infra/migrations",
       "purpose": "Database migrations",
       "fileCount": 0,
-      "lastAccessed": 1776240374026,
+      "lastAccessed": 1776338994063,
       "keyFiles": []
     }
   },
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 13,
-      "lastAccessed": 1776316133924,
+      "accessCount": 14,
+      "lastAccessed": 1776339077526,
       "type": "file"
     },
     {
@@ -126,14 +133,14 @@
     },
     {
       "path": "crates/binance/src/error.rs",
-      "accessCount": 6,
-      "lastAccessed": 1776243137123,
+      "accessCount": 7,
+      "lastAccessed": 1776339035884,
       "type": "file"
     },
     {
       "path": "crates/core/src/lib.rs",
-      "accessCount": 6,
-      "lastAccessed": 1776314043488,
+      "accessCount": 7,
+      "lastAccessed": 1776339092629,
       "type": "file"
     },
     {
@@ -144,20 +151,20 @@
     },
     {
       "path": "crates/binance/src/lib.rs",
-      "accessCount": 4,
-      "lastAccessed": 1776313584746,
+      "accessCount": 6,
+      "lastAccessed": 1776339137055,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/Cargo.toml",
+      "accessCount": 5,
+      "lastAccessed": 1776339047190,
       "type": "file"
     },
     {
       "path": "crates/binance/src/spot.rs",
       "accessCount": 4,
       "lastAccessed": 1776313593913,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/Cargo.toml",
-      "accessCount": 3,
-      "lastAccessed": 1776243143512,
       "type": "file"
     },
     {
@@ -191,6 +198,12 @@
       "type": "file"
     },
     {
+      "path": "Makefile",
+      "accessCount": 3,
+      "lastAccessed": 1776339084864,
+      "type": "file"
+    },
+    {
       "path": "config/base.yaml",
       "accessCount": 2,
       "lastAccessed": 1776241639867,
@@ -212,12 +225,6 @@
       "path": "config/prod.yaml",
       "accessCount": 2,
       "lastAccessed": 1776241650990,
-      "type": "file"
-    },
-    {
-      "path": "Makefile",
-      "accessCount": 2,
-      "lastAccessed": 1776241668064,
       "type": "file"
     },
     {
@@ -263,9 +270,15 @@
       "type": "file"
     },
     {
+      "path": "crates/binance/src/rest.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776338950543,
+      "type": "file"
+    },
+    {
       "path": "infra/compose/docker-compose.yml",
-      "accessCount": 1,
-      "lastAccessed": 1776241028296,
+      "accessCount": 2,
+      "lastAccessed": 1776339096999,
       "type": "file"
     },
     {
@@ -380,12 +393,6 @@
       "path": "crates/binance/testdata/depth_snapshot.json",
       "accessCount": 1,
       "lastAccessed": 1776243065361,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/rest.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776243081882,
       "type": "file"
     },
     {

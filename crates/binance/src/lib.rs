@@ -17,10 +17,15 @@
 pub mod book;
 pub mod decode;
 pub mod error;
+pub mod order_rest;
 pub mod rest;
 pub mod spot;
 
 pub use book::{BinanceBookSync, BookUpdate, SyncState};
 pub use error::BinanceError;
+pub use order_rest::{
+    AccountSummary, Balance, CancelOrderRequest, NewOrderRequest, OrderAck, OrderSelector,
+    OrderType, QueryOrderRequest, Side, SignedClient, TimeInForce, MAINNET_BASE, TESTNET_BASE,
+};
 pub use rest::{fetch_depth_snapshot, parse_depth_snapshot, DepthSnapshot};
 pub use spot::{SpotStreamClient, SpotStreamConfig};
