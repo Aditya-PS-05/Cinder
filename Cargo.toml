@@ -45,6 +45,8 @@ ts-config = { path = "crates/config" }
 ts-storage = { path = "crates/storage" }
 ts-book = { path = "crates/book" }
 ts-binance = { path = "crates/binance" }
+ts-risk = { path = "crates/risk" }
+ts-paper = { path = "crates/paper" }
 
 [profile.release]
 lto = "thin"

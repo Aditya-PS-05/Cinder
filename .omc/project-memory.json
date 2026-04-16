@@ -114,8 +114,8 @@
     },
     {
       "path": "Cargo.toml",
-      "accessCount": 5,
-      "lastAccessed": 1776243145158,
+      "accessCount": 6,
+      "lastAccessed": 1776310237024,
       "type": "file"
     },
     {
@@ -128,6 +128,12 @@
       "path": "crates/binance/Cargo.toml",
       "accessCount": 3,
       "lastAccessed": 1776243143512,
+      "type": "file"
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776310156241,
       "type": "file"
     },
     {
@@ -293,12 +299,6 @@
       "type": "file"
     },
     {
-      "path": "crates/core/src/lib.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776242365523,
-      "type": "file"
-    },
-    {
       "path": "crates/core/src/market.rs",
       "accessCount": 1,
       "lastAccessed": 1776242366110,
@@ -380,6 +380,30 @@
       "path": "crates/binance/src/book.rs",
       "accessCount": 1,
       "lastAccessed": 1776243125089,
+      "type": "file"
+    },
+    {
+      "path": "crates/core/src/order.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776310153295,
+      "type": "file"
+    },
+    {
+      "path": "crates/risk/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1776310157629,
+      "type": "file"
+    },
+    {
+      "path": "crates/risk/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776310194584,
+      "type": "file"
+    },
+    {
+      "path": "crates/paper/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1776310195660,
       "type": "file"
     }
   ],

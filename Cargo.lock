@@ -2015,6 +2015,22 @@ name = "ts-core"
 version = "0.0.1"
 
 [[package]]
+name = "ts-paper"
+version = "0.1.0"
+dependencies = [
+ "ts-book",
+ "ts-core",
+]
+
+[[package]]
+name = "ts-risk"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "ts-core",
+]
+
+[[package]]
 name = "ts-storage"
 version = "0.1.0"
 dependencies = [

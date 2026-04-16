@@ -10,6 +10,7 @@
 pub mod bus;
 pub mod decimal;
 pub mod market;
+pub mod order;
 pub mod time;
 pub mod venue;
 
@@ -17,5 +18,6 @@ pub use decimal::{DecimalError, Price, Qty};
 pub use market::{
     BookDelta, BookLevel, BookSnapshot, Funding, Liquidation, MarketEvent, MarketPayload, Trade,
 };
+pub use order::{ClientOrderId, ExecReport, Fill, NewOrder, OrderKind, OrderStatus, TimeInForce};
 pub use time::Timestamp;
 pub use venue::{InstrumentSpec, Side, Symbol, Venue};
