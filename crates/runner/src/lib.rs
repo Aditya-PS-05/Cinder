@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod tape;
 
 use std::sync::Arc;
@@ -27,12 +28,15 @@ use ts_core::{bus::Subscription, MarketEvent};
 use ts_replay::{Replay, ReplaySummary};
 use ts_strategy::Strategy;
 
+use crate::audit::AuditEvent;
+
 pub struct EngineRunner<S: Strategy> {
     replay: Replay<S>,
     rx: mpsc::Receiver<MarketEvent>,
     shutdown: Arc<Notify>,
     summary_tx: Option<broadcast::Sender<ReplaySummary>>,
     summary_interval: Duration,
+    audit_tx: Option<mpsc::Sender<AuditEvent>>,
 }
 
 /// Remote control for an [`EngineRunner`]. Dropping the handle does not
@@ -89,8 +93,22 @@ impl<S: Strategy> EngineRunner<S> {
             shutdown,
             summary_tx,
             summary_interval: interval,
+            audit_tx: None,
         };
         (runner, handle)
+    }
+
+    /// Attach a channel that receives every [`ExecReport`] and [`Fill`]
+    /// emitted by the engine. The runner calls `send().await` so capture
+    /// is lossless under backpressure — size the channel to absorb your
+    /// longest expected writer stall. Pair with
+    /// [`audit::spawn_audit_writer`] to persist to disk.
+    ///
+    /// [`ExecReport`]: ts_core::ExecReport
+    /// [`Fill`]: ts_core::Fill
+    pub fn with_audit(mut self, audit_tx: mpsc::Sender<AuditEvent>) -> Self {
+        self.audit_tx = Some(audit_tx);
+        self
     }
 
     /// Drive the replay loop until the event channel closes or the
@@ -119,8 +137,30 @@ impl<S: Strategy> EngineRunner<S> {
                         debug!("runner: event channel closed");
                         break;
                     };
-                    if let Err(err) = self.replay.step(&event) {
-                        warn!(error = ?err, "runner: book error, dropping event");
+                    match self.replay.step(&event) {
+                        Ok(step) => {
+                            if let Some(tx) = self.audit_tx.as_ref() {
+                                for r in &step.reports {
+                                    if tx.send(AuditEvent::Report(r.clone())).await.is_err() {
+                                        debug!("runner: audit sink closed, detaching");
+                                        self.audit_tx = None;
+                                        break;
+                                    }
+                                }
+                                if let Some(tx) = self.audit_tx.as_ref() {
+                                    for f in &step.fills {
+                                        if tx.send(AuditEvent::Fill(f.clone())).await.is_err() {
+                                            debug!("runner: audit sink closed, detaching");
+                                            self.audit_tx = None;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = ?err, "runner: book error, dropping event");
+                        }
                     }
                 }
                 _ = async {
@@ -287,6 +327,53 @@ mod tests {
 
         bus.close();
         let _ = bridge.await;
+        handle.shutdown();
+
+        let summary = task.await.unwrap();
+        assert!(summary.metrics.events_ingested >= 2);
+    }
+
+    #[tokio::test]
+    async fn audit_tap_forwards_reports_and_fills() {
+        use crate::audit::AuditEvent;
+        let (tx, rx) = mpsc::channel(16);
+        let (audit_tx, mut audit_rx) = mpsc::channel::<AuditEvent>(64);
+        let (runner, handle) = EngineRunner::new(build_replay(), rx);
+        let runner = runner.with_audit(audit_tx);
+        let task = tokio::spawn(runner.run());
+
+        // A snapshot drives the maker to place quotes, which produces
+        // at least one OrderStatus::New report (no fills, since paper
+        // fills require opposing flow).
+        tx.send(snapshot(100, 110, 1)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        handle.shutdown();
+        let _summary = task.await.unwrap();
+
+        let mut reports = 0;
+        while let Ok(evt) = audit_rx.try_recv() {
+            if matches!(evt, AuditEvent::Report(_)) {
+                reports += 1;
+            }
+        }
+        assert!(reports > 0, "expected at least one report on the audit tap");
+    }
+
+    #[tokio::test]
+    async fn audit_tap_detaches_when_receiver_drops() {
+        use crate::audit::AuditEvent;
+        let (tx, rx) = mpsc::channel(16);
+        let (audit_tx, audit_rx) = mpsc::channel::<AuditEvent>(1);
+        drop(audit_rx); // sink closed before any event flows.
+        let (runner, handle) = EngineRunner::new(build_replay(), rx);
+        let runner = runner.with_audit(audit_tx);
+        let task = tokio::spawn(runner.run());
+
+        // Runner must keep going even with a dead audit sink.
+        tx.send(snapshot(100, 110, 1)).await.unwrap();
+        tx.send(snapshot(101, 111, 2)).await.unwrap();
+        tokio::task::yield_now().await;
         handle.shutdown();
 
         let summary = task.await.unwrap();

@@ -10,6 +10,7 @@
 //! and never sends orders to an exchange.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,10 @@ use ts_binance::{SpotStreamClient, SpotStreamConfig};
 use ts_core::{bus::Bus, InstrumentSpec, MarketEvent, Qty, Symbol, Venue};
 use ts_oms::{EngineConfig, PaperEngine, RiskConfig};
 use ts_replay::{Replay, ReplaySummary};
-use ts_runner::{bridge_bus, EngineRunner};
+use ts_runner::{
+    audit::{spawn_audit_writer, AuditWriter},
+    bridge_bus, EngineRunner,
+};
 use ts_strategy::{InventorySkewMaker, MakerConfig};
 
 #[derive(Parser, Debug)]
@@ -74,6 +78,11 @@ struct Cli {
     /// Bus subscription + mpsc channel capacity.
     #[arg(long, default_value_t = 4096)]
     channel: usize,
+
+    /// Append every ExecReport and Fill to this NDJSON file. Disabled
+    /// when omitted.
+    #[arg(long)]
+    audit: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -130,7 +139,16 @@ async fn main() -> Result<()> {
     let bridge = bridge_bus(sub, tx);
 
     let summary_interval = Duration::from_secs(cli.summary_secs);
-    let (runner, handle) = EngineRunner::with_summary_tap(replay, rx, summary_interval, 8);
+    let (mut runner, handle) = EngineRunner::with_summary_tap(replay, rx, summary_interval, 8);
+
+    let audit_task = if let Some(path) = cli.audit.as_ref() {
+        let writer = AuditWriter::create(path).await.context("open audit log")?;
+        let (audit_tx, audit_rx) = mpsc::channel(cli.channel);
+        runner = runner.with_audit(audit_tx);
+        Some(spawn_audit_writer(writer, audit_rx))
+    } else {
+        None
+    };
 
     let printer = handle.subscribe_summaries().map(|mut sub| {
         let sym = symbol_str.clone();
@@ -164,6 +182,12 @@ async fn main() -> Result<()> {
     }
 
     let summary = runner_task.await.context("runner task")?;
+    if let Some(task) = audit_task {
+        match task.await {
+            Ok(written) => tracing::info!(events = written, "audit log flushed"),
+            Err(err) => tracing::error!(error = %err, "audit task join failed"),
+        }
+    }
     log_summary(&symbol_str, "final", &summary);
     Ok(())
 }

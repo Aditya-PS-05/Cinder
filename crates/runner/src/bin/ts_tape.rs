@@ -16,6 +16,7 @@ use ts_core::{bus::Bus, InstrumentSpec, MarketEvent, Qty, Symbol, Venue};
 use ts_oms::{EngineConfig, PaperEngine, RiskConfig};
 use ts_replay::{Replay, ReplaySummary};
 use ts_runner::{
+    audit::{spawn_audit_writer, AuditWriter},
     tape::{pump_tape, TapeReader, TapeWriter},
     EngineRunner,
 };
@@ -71,6 +72,9 @@ enum Cmd {
         /// mpsc channel capacity between reader and runner.
         #[arg(long, default_value_t = 4096)]
         channel: usize,
+        /// Append every ExecReport and Fill to this NDJSON file.
+        #[arg(long)]
+        audit: Option<PathBuf>,
     },
 }
 
@@ -101,6 +105,7 @@ async fn main() -> Result<()> {
             max_inventory,
             cid_prefix,
             channel,
+            audit,
         } => {
             run_replay(
                 tape,
@@ -111,6 +116,7 @@ async fn main() -> Result<()> {
                 max_inventory,
                 cid_prefix,
                 channel,
+                audit,
             )
             .await
         }
@@ -199,6 +205,7 @@ async fn run_replay(
     max_inventory: i64,
     cid_prefix: String,
     channel: usize,
+    audit: Option<PathBuf>,
 ) -> Result<()> {
     let symbol_str = symbol.to_uppercase();
     let sym = Symbol::new(symbol_str.clone());
@@ -227,12 +234,27 @@ async fn run_replay(
     let reader = TapeReader::open(&tape).await.context("open tape")?;
     let reader_task = tokio::spawn(pump_tape(reader, tx));
 
-    let (runner, _handle) = EngineRunner::with_summary_tap(replay, rx, Duration::ZERO, 0);
+    let (mut runner, _handle) = EngineRunner::with_summary_tap(replay, rx, Duration::ZERO, 0);
+    let audit_task = if let Some(path) = audit.as_ref() {
+        let writer = AuditWriter::create(path).await.context("open audit log")?;
+        let (audit_tx, audit_rx) = mpsc::channel(channel);
+        runner = runner.with_audit(audit_tx);
+        Some(spawn_audit_writer(writer, audit_rx))
+    } else {
+        None
+    };
+
     let summary = runner.run().await;
     let count = reader_task
         .await
         .context("reader task")?
         .context("tape read")?;
+    if let Some(task) = audit_task {
+        match task.await {
+            Ok(written) => tracing::info!(events = written, "audit log flushed"),
+            Err(err) => tracing::error!(error = %err, "audit task join failed"),
+        }
+    }
     tracing::info!(tape = %tape.display(), events_read = count, "tape drained");
     print_summary(&symbol_str, &summary);
     Ok(())
