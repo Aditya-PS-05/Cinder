@@ -1,0 +1,20 @@
+[package]
+name = "ts-report"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+ts-core = { workspace = true, features = ["serde"] }
+ts-pnl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "ts-report"
+path = "src/bin/ts_report.rs"

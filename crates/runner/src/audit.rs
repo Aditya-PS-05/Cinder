@@ -13,21 +13,12 @@
 use std::io;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use ts_core::{ExecReport, Fill};
-
-/// One line on the audit tape.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AuditEvent {
-    Report(ExecReport),
-    Fill(Fill),
-}
+pub use ts_core::AuditEvent;
 
 /// Append-only writer for [`AuditEvent`]s. Mirrors [`crate::tape::TapeWriter`]
 /// but dedicated to the post-trade stream so recording market data and
@@ -91,7 +82,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::AsyncBufReadExt;
-    use ts_core::{ClientOrderId, OrderStatus, Price, Qty, Side, Symbol, Timestamp, Venue};
+    use ts_core::{
+        ClientOrderId, ExecReport, Fill, OrderStatus, Price, Qty, Side, Symbol, Timestamp, Venue,
+    };
 
     fn unique_path(tag: &str) -> std::path::PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);

@@ -115,8 +115,8 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 17,
-      "lastAccessed": 1776358331524,
+      "accessCount": 18,
+      "lastAccessed": 1776359272185,
       "type": "file"
     },
     {
@@ -126,33 +126,33 @@
       "type": "file"
     },
     {
+      "path": "crates/core/src/order.rs",
+      "accessCount": 10,
+      "lastAccessed": 1776359301434,
+      "type": "file"
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "accessCount": 10,
+      "lastAccessed": 1776359446299,
+      "type": "file"
+    },
+    {
       "path": "crates/binance/src/error.rs",
       "accessCount": 9,
       "lastAccessed": 1776357435215,
       "type": "file"
     },
     {
-      "path": "crates/core/src/order.rs",
-      "accessCount": 9,
-      "lastAccessed": 1776357473434,
-      "type": "file"
-    },
-    {
-      "path": "crates/core/src/lib.rs",
+      "path": "crates/core/src/venue.rs",
       "accessCount": 8,
-      "lastAccessed": 1776354798976,
+      "lastAccessed": 1776359429423,
       "type": "file"
     },
     {
       "path": "crates/core/src/market.rs",
       "accessCount": 7,
       "lastAccessed": 1776314209892,
-      "type": "file"
-    },
-    {
-      "path": "crates/core/src/venue.rs",
-      "accessCount": 7,
-      "lastAccessed": 1776354802952,
       "type": "file"
     },
     {
@@ -169,8 +169,8 @@
     },
     {
       "path": "crates/core/src/decimal.rs",
-      "accessCount": 4,
-      "lastAccessed": 1776354803252,
+      "accessCount": 5,
+      "lastAccessed": 1776359305959,
       "type": "file"
     },
     {

@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "serde")]
+pub mod audit;
 pub mod bus;
 pub mod decimal;
 pub mod market;
@@ -14,6 +16,8 @@ pub mod order;
 pub mod time;
 pub mod venue;
 
+#[cfg(feature = "serde")]
+pub use audit::AuditEvent;
 pub use decimal::{DecimalError, Price, Qty};
 pub use market::{
     BookDelta, BookLevel, BookSnapshot, Funding, Liquidation, MarketEvent, MarketPayload, Trade,

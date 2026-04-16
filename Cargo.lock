@@ -2071,6 +2071,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts-report"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "ts-core",
+ "ts-pnl",
+]
+
+[[package]]
 name = "ts-risk"
 version = "0.1.0"
 dependencies = [
