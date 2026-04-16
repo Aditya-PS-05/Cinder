@@ -108,8 +108,8 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 7,
-      "lastAccessed": 1776310693293,
+      "accessCount": 8,
+      "lastAccessed": 1776311259016,
       "type": "file"
     },
     {
@@ -176,6 +176,12 @@
       "path": "crates/core/src/order.rs",
       "accessCount": 2,
       "lastAccessed": 1776310606334,
+      "type": "file"
+    },
+    {
+      "path": "crates/core/src/market.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776311100565,
       "type": "file"
     },
     {
@@ -302,12 +308,6 @@
       "path": "infra/migrations/clickhouse/V005__liquidations.sql",
       "accessCount": 1,
       "lastAccessed": 1776241630225,
-      "type": "file"
-    },
-    {
-      "path": "crates/core/src/market.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776242366110,
       "type": "file"
     },
     {

@@ -48,6 +48,7 @@ ts-binance = { path = "crates/binance" }
 ts-risk = { path = "crates/risk" }
 ts-paper = { path = "crates/paper" }
 ts-strategy = { path = "crates/strategy" }
+ts-oms = { path = "crates/oms" }
 
 [profile.release]
 lto = "thin"

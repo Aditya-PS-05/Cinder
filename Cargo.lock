@@ -2015,6 +2015,17 @@ name = "ts-core"
 version = "0.0.1"
 
 [[package]]
+name = "ts-oms"
+version = "0.1.0"
+dependencies = [
+ "ts-book",
+ "ts-core",
+ "ts-paper",
+ "ts-risk",
+ "ts-strategy",
+]
+
+[[package]]
 name = "ts-paper"
 version = "0.1.0"
 dependencies = [

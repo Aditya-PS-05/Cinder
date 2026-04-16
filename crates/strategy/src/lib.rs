@@ -41,6 +41,20 @@ pub trait Strategy: Send {
     fn on_exec_report(&mut self, _report: &ExecReport) {}
 }
 
+/// Forwarding impl so callers can own a strategy behind a trait object
+/// and hand it to code that is generic over `S: Strategy`.
+impl Strategy for Box<dyn Strategy> {
+    fn on_book_update(&mut self, now: Timestamp, book: &OrderBook) -> Vec<StrategyAction> {
+        (**self).on_book_update(now, book)
+    }
+    fn on_fill(&mut self, fill: &Fill) {
+        (**self).on_fill(fill)
+    }
+    fn on_exec_report(&mut self, report: &ExecReport) {
+        (**self).on_exec_report(report)
+    }
+}
+
 /// `true` when an [`OrderStatus`] will not produce further fills.
 pub fn is_terminal(status: OrderStatus) -> bool {
     matches!(
