@@ -15,7 +15,9 @@
 #![forbid(unsafe_code)]
 
 use ts_book::BookError;
-use ts_core::{ClientOrderId, ExecReport, Fill, MarketEvent, NewOrder, OrderStatus, Price, Timestamp};
+use ts_core::{
+    ClientOrderId, ExecReport, Fill, MarketEvent, NewOrder, OrderStatus, Price, Timestamp,
+};
 use ts_oms::{EngineStep, PaperEngine};
 use ts_pnl::Accountant;
 use ts_strategy::Strategy;

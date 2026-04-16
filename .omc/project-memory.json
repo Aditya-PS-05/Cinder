@@ -108,8 +108,8 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 11,
-      "lastAccessed": 1776312377696,
+      "accessCount": 12,
+      "lastAccessed": 1776312758524,
       "type": "file"
     },
     {
@@ -212,6 +212,30 @@
       "path": "crates/storage/Cargo.toml",
       "accessCount": 2,
       "lastAccessed": 1776312130507,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/spot.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776312660733,
+      "type": "file"
+    },
+    {
+      "path": "crates/core/src/bus.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776312666759,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/bin/ts_md_binance.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776312667069,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/book.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776312674173,
       "type": "file"
     },
     {
@@ -323,12 +347,6 @@
       "type": "file"
     },
     {
-      "path": "crates/core/src/bus.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776242367782,
-      "type": "file"
-    },
-    {
       "path": "crates/core/src/time.rs",
       "accessCount": 1,
       "lastAccessed": 1776242367823,
@@ -344,18 +362,6 @@
       "path": "crates/binance/testdata/depth_update.json",
       "accessCount": 1,
       "lastAccessed": 1776242428250,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/spot.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776242449951,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/bin/ts_md_binance.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776242465002,
       "type": "file"
     },
     {
@@ -380,12 +386,6 @@
       "path": "crates/binance/src/rest.rs",
       "accessCount": 1,
       "lastAccessed": 1776243081882,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/book.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776243125089,
       "type": "file"
     },
     {

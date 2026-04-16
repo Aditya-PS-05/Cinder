@@ -171,7 +171,13 @@ mod tests {
         b
     }
 
-    fn order(side: Side, kind: OrderKind, tif: TimeInForce, qty: i64, price: Option<i64>) -> NewOrder {
+    fn order(
+        side: Side,
+        kind: OrderKind,
+        tif: TimeInForce,
+        qty: i64,
+        price: Option<i64>,
+    ) -> NewOrder {
         NewOrder {
             cid: ClientOrderId::new("c1"),
             venue: Venue::BINANCE,

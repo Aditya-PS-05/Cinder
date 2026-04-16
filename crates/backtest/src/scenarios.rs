@@ -19,7 +19,11 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
 
     fn next(&mut self) -> u64 {

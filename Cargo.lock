@@ -2072,6 +2072,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts-runner"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "ts-core",
+ "ts-oms",
+ "ts-replay",
+ "ts-strategy",
+]
+
+[[package]]
 name = "ts-storage"
 version = "0.1.0"
 dependencies = [

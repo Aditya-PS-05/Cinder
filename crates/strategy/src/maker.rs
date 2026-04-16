@@ -67,7 +67,10 @@ impl InventorySkewMaker {
 
     fn next_cid(&mut self, tag: &str) -> ClientOrderId {
         self.cid_counter += 1;
-        ClientOrderId::new(format!("{}-{}-{}", self.cfg.cid_prefix, tag, self.cid_counter))
+        ClientOrderId::new(format!(
+            "{}-{}-{}",
+            self.cfg.cid_prefix, tag, self.cid_counter
+        ))
     }
 
     fn build_order(
@@ -103,10 +106,7 @@ impl Strategy for InventorySkewMaker {
         // Inventory skew shifts both quotes by the same amount, so the
         // spread is preserved but the center of mass walks away from the
         // side the maker is long on.
-        let skew_shift = self
-            .cfg
-            .inventory_skew_ticks
-            .saturating_mul(self.inventory);
+        let skew_shift = self.cfg.inventory_skew_ticks.saturating_mul(self.inventory);
         let bid_px = mid
             .saturating_sub(self.cfg.half_spread_ticks)
             .saturating_sub(skew_shift);

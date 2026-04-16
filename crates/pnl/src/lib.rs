@@ -106,8 +106,8 @@ impl Accountant {
         F: Fn(&Symbol) -> Option<Price>,
     {
         self.books
-            .iter()
-            .map(|(sym, _)| mark_fn(sym).map_or(0, |m| self.unrealized(sym, m)))
+            .keys()
+            .map(|sym| mark_fn(sym).map_or(0, |m| self.unrealized(sym, m)))
             .sum()
     }
 
@@ -340,7 +340,7 @@ mod tests {
             "ETHUSDT" => Some(Price(3_200)),
             _ => None,
         });
-        assert_eq!(total, (110 - 100) * 5 + (3_200 - 3_000) * 1);
+        assert_eq!(total, (110 - 100) * 5 + (3_200 - 3_000));
     }
 
     #[test]
