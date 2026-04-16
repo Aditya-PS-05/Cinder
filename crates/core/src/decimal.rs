@@ -38,10 +38,14 @@ const POW10: [i64; 19] = [
 
 /// Fixed-point price expressed at an instrument-specific scale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Price(pub i64);
 
 /// Fixed-point quantity expressed at an instrument-specific scale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Qty(pub i64);
 
 /// Errors the decimal helpers can produce.

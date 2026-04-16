@@ -9,6 +9,8 @@ use crate::decimal::Qty;
 /// well-known venues live in the binary without allocation, but runtime
 /// discoveries can still be constructed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Venue(Cow<'static, str>);
 
 impl Venue {
@@ -47,6 +49,8 @@ impl fmt::Display for Venue {
 /// Venue-local instrument identifier (e.g. `"BTCUSDT"` on Binance, a pool
 /// address on a DEX).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Symbol(Cow<'static, str>);
 
 impl Symbol {
@@ -69,6 +73,7 @@ impl fmt::Display for Symbol {
 
 /// Trade direction / order side.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Side {
     #[default]
@@ -99,6 +104,7 @@ impl fmt::Display for Side {
 
 /// Quantization rules and metadata for a single instrument on a single venue.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InstrumentSpec {
     pub venue: Venue,
     pub symbol: Symbol,

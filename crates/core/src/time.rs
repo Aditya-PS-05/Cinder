@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Nanoseconds since the Unix epoch. Zero sentinels "unset".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Timestamp(pub i64);
 
 impl Timestamp {

@@ -11,6 +11,8 @@ use crate::venue::{Side, Symbol, Venue};
 
 /// Idempotency key supplied by the caller. Opaque to the system.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct ClientOrderId(pub String);
 
 impl ClientOrderId {
@@ -23,12 +25,14 @@ impl ClientOrderId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum OrderKind {
     Limit,
     Market,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TimeInForce {
     /// Good-til-cancel: unfilled remainder rests on the book.
     Gtc,
@@ -39,6 +43,7 @@ pub enum TimeInForce {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum OrderStatus {
     New,
     PartiallyFilled,
@@ -49,6 +54,7 @@ pub enum OrderStatus {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NewOrder {
     pub cid: ClientOrderId,
     pub venue: Venue,
@@ -63,6 +69,7 @@ pub struct NewOrder {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Fill {
     pub cid: ClientOrderId,
     pub venue: Venue,
@@ -76,6 +83,7 @@ pub struct Fill {
 /// Terminal result of submitting a single order: every fill that
 /// occurred plus the final [`OrderStatus`].
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExecReport {
     pub cid: ClientOrderId,
     pub status: OrderStatus,

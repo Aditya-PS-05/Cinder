@@ -2025,6 +2025,10 @@ dependencies = [
 [[package]]
 name = "ts-core"
 version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "ts-oms"
@@ -2077,6 +2081,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

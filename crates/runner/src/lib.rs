@@ -14,6 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod tape;
+
 use std::sync::Arc;
 use std::time::Duration;
 

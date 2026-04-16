@@ -8,3 +8,15 @@ publish.workspace = true
 description = "Shared primitives used across every trading-system service."
 
 [dependencies]
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+serde = { workspace = true }
+
+[features]
+default = []
+# Enable `serde::{Serialize, Deserialize}` derives on every wire-visible type.
+# Foundation crates default to std-only; consumers that need on-disk tapes,
+# JSON audit dumps, or HTTP payloads opt in explicitly.
+serde = ["dep:serde"]

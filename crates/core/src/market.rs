@@ -9,6 +9,7 @@ use crate::venue::{Side, Symbol, Venue};
 /// connector decoded the message. Their delta is the visible latency for
 /// that hop.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MarketEvent {
     pub venue: Venue,
     pub symbol: Symbol,
@@ -34,6 +35,8 @@ impl MarketEvent {
 /// Sum type over every payload that can flow through the market data bus.
 /// Rust's native enum gives us exhaustive matching for free.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
 pub enum MarketPayload {
     Trade(Trade),
     BookSnapshot(BookSnapshot),
@@ -43,6 +46,7 @@ pub enum MarketPayload {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Trade {
     pub id: String,
     pub price: Price,
@@ -52,6 +56,7 @@ pub struct Trade {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BookLevel {
     pub price: Price,
     pub qty: Qty,
@@ -60,6 +65,7 @@ pub struct BookLevel {
 /// Full order book snapshot. Bids are sorted descending, asks ascending.
 /// Producers enforce the invariant; consumers may rely on it.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BookSnapshot {
     pub bids: Vec<BookLevel>,
     pub asks: Vec<BookLevel>,
@@ -67,6 +73,7 @@ pub struct BookSnapshot {
 
 /// Incremental book update. A level with `qty == 0` means "delete".
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BookDelta {
     pub bids: Vec<BookLevel>,
     pub asks: Vec<BookLevel>,
@@ -75,6 +82,7 @@ pub struct BookDelta {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Funding {
     /// Signed fraction; 0.0001 = 1 bp per funding interval.
     pub rate: f64,
@@ -82,6 +90,7 @@ pub struct Funding {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Liquidation {
     pub price: Price,
     pub qty: Qty,
@@ -125,6 +134,32 @@ mod tests {
         }));
         e.exchange_ts = Timestamp::default();
         assert_eq!(e.latency_nanos(), 0);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn json_roundtrip_preserves_payload() {
+        let e = sample_event(MarketPayload::BookSnapshot(BookSnapshot {
+            bids: vec![BookLevel {
+                price: Price(99),
+                qty: Qty(1),
+            }],
+            asks: vec![BookLevel {
+                price: Price(101),
+                qty: Qty(1),
+            }],
+        }));
+        let j = serde_json::to_string(&e).expect("serialize");
+        let back: MarketEvent = serde_json::from_str(&j).expect("deserialize");
+        assert_eq!(back.seq, e.seq);
+        assert_eq!(back.symbol.as_str(), e.symbol.as_str());
+        match back.payload {
+            MarketPayload::BookSnapshot(bs) => {
+                assert_eq!(bs.bids[0].price, Price(99));
+                assert_eq!(bs.asks[0].price, Price(101));
+            }
+            _ => panic!("payload variant drifted through roundtrip"),
+        }
     }
 
     #[test]
