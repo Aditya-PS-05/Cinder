@@ -2087,6 +2087,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-binance",
+ "ts-config",
  "ts-core",
  "ts-oms",
  "ts-replay",

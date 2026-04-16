@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod paper_cfg;
 pub mod tape;
 
 use std::sync::Arc;

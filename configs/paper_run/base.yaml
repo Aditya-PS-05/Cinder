@@ -1,0 +1,17 @@
+# Defaults shared by every deployment overlay.
+market:
+  symbol: BTCUSDT
+  price_scale: 2
+  qty_scale: 8
+  ws_url: wss://stream.binance.com:9443/ws
+
+maker:
+  quote_qty: 2
+  half_spread_ticks: 5
+  inventory_skew_ticks: 1
+  max_inventory: 20
+  cid_prefix: pr
+
+runner:
+  summary_secs: 5
+  channel: 4096

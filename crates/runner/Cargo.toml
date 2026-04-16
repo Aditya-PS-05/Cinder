@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 ts-core = { workspace = true, features = ["serde"] }
+ts-config.workspace = true
 ts-oms.workspace = true
 ts-replay.workspace = true
 ts-strategy.workspace = true

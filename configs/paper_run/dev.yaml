@@ -1,0 +1,7 @@
+# Dev overlay — tiny quotes, verbose summary cadence.
+maker:
+  quote_qty: 1
+  cid_prefix: dev
+
+runner:
+  summary_secs: 2

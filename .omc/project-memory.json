@@ -108,8 +108,8 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 12,
-      "lastAccessed": 1776312758524,
+      "accessCount": 13,
+      "lastAccessed": 1776316133924,
       "type": "file"
     },
     {
@@ -185,6 +185,12 @@
       "type": "file"
     },
     {
+      "path": "crates/config/src/lib.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776315998380,
+      "type": "file"
+    },
+    {
       "path": "config/base.yaml",
       "accessCount": 2,
       "lastAccessed": 1776241639867,
@@ -254,12 +260,6 @@
       "path": "crates/binance/src/book.rs",
       "accessCount": 2,
       "lastAccessed": 1776312674173,
-      "type": "file"
-    },
-    {
-      "path": "crates/config/src/lib.rs",
-      "accessCount": 2,
-      "lastAccessed": 1776313565915,
       "type": "file"
     },
     {

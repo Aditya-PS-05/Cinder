@@ -1,0 +1,12 @@
+# Prod-ish overlay — paper still, but with production cadence and an
+# audit sink enabled by default. The actual audit path should come
+# from env: TS_AUDIT_PATH=/var/log/ts/audit.ndjson.
+maker:
+  quote_qty: 3
+  cid_prefix: live
+
+runner:
+  summary_secs: 30
+
+audit:
+  path: ./paper-audit.ndjson
