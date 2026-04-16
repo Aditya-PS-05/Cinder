@@ -1981,6 +1981,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1988,6 +1989,15 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "ts-book",
+ "ts-core",
+]
+
+[[package]]
+name = "ts-book"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
  "ts-core",
 ]
 

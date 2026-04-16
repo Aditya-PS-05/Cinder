@@ -107,15 +107,27 @@
   },
   "hotPaths": [
     {
-      "path": "Cargo.toml",
-      "accessCount": 4,
-      "lastAccessed": 1776242235188,
+      "path": "crates/binance/src/error.rs",
+      "accessCount": 6,
+      "lastAccessed": 1776243137123,
       "type": "file"
     },
     {
-      "path": "crates/binance/src/error.rs",
-      "accessCount": 4,
-      "lastAccessed": 1776242538466,
+      "path": "Cargo.toml",
+      "accessCount": 5,
+      "lastAccessed": 1776243145158,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/lib.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776243140144,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/Cargo.toml",
+      "accessCount": 3,
+      "lastAccessed": 1776243143512,
       "type": "file"
     },
     {
@@ -317,18 +329,6 @@
       "type": "file"
     },
     {
-      "path": "crates/binance/Cargo.toml",
-      "accessCount": 1,
-      "lastAccessed": 1776242377858,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/lib.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776242383461,
-      "type": "file"
-    },
-    {
       "path": "crates/binance/testdata/trade.json",
       "accessCount": 1,
       "lastAccessed": 1776242426357,
@@ -350,6 +350,36 @@
       "path": "crates/binance/src/bin/ts_md_binance.rs",
       "accessCount": 1,
       "lastAccessed": 1776242465002,
+      "type": "file"
+    },
+    {
+      "path": "crates/book/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1776243021533,
+      "type": "file"
+    },
+    {
+      "path": "crates/book/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776243064205,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/testdata/depth_snapshot.json",
+      "accessCount": 1,
+      "lastAccessed": 1776243065361,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/rest.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776243081882,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/book.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776243125089,
       "type": "file"
     }
   ],

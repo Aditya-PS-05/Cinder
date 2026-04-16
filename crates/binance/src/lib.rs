@@ -14,9 +14,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod book;
 pub mod decode;
 pub mod error;
+pub mod rest;
 pub mod spot;
 
+pub use book::{BinanceBookSync, BookUpdate, SyncState};
 pub use error::BinanceError;
+pub use rest::{fetch_depth_snapshot, parse_depth_snapshot, DepthSnapshot};
 pub use spot::{SpotStreamClient, SpotStreamConfig};

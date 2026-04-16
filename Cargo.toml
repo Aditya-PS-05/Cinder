@@ -43,6 +43,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 ts-core = { path = "crates/core" }
 ts-config = { path = "crates/config" }
 ts-storage = { path = "crates/storage" }
+ts-book = { path = "crates/book" }
 ts-binance = { path = "crates/binance" }
 
 [profile.release]
