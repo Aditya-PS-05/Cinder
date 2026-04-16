@@ -2051,6 +2051,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts-strategy"
+version = "0.1.0"
+dependencies = [
+ "ts-book",
+ "ts-core",
+]
+
+[[package]]
 name = "tungstenite"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
