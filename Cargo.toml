@@ -51,6 +51,7 @@ ts-strategy = { path = "crates/strategy" }
 ts-oms = { path = "crates/oms" }
 ts-pnl = { path = "crates/pnl" }
 ts-replay = { path = "crates/replay" }
+ts-backtest = { path = "crates/backtest" }
 
 [profile.release]
 lto = "thin"

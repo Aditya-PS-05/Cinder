@@ -108,8 +108,8 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 10,
-      "lastAccessed": 1776311969669,
+      "accessCount": 11,
+      "lastAccessed": 1776312377696,
       "type": "file"
     },
     {
@@ -185,6 +185,36 @@
       "type": "file"
     },
     {
+      "path": "infra/migrations/postgres/V002__orders_and_fills.sql",
+      "accessCount": 2,
+      "lastAccessed": 1776312124888,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/postgres.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776312125183,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/lib.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776312125594,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/postgres/V001__instruments_and_accounts.sql",
+      "accessCount": 2,
+      "lastAccessed": 1776312130010,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/Cargo.toml",
+      "accessCount": 2,
+      "lastAccessed": 1776312130507,
+      "type": "file"
+    },
+    {
       "path": "infra/compose/docker-compose.yml",
       "accessCount": 1,
       "lastAccessed": 1776241028296,
@@ -203,18 +233,6 @@
       "type": "file"
     },
     {
-      "path": "crates/storage/Cargo.toml",
-      "accessCount": 1,
-      "lastAccessed": 1776241458700,
-      "type": "file"
-    },
-    {
-      "path": "crates/storage/src/lib.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776241463064,
-      "type": "file"
-    },
-    {
       "path": "crates/storage/src/error.rs",
       "accessCount": 1,
       "lastAccessed": 1776241468088,
@@ -230,12 +248,6 @@
       "path": "crates/storage/src/migrate.rs",
       "accessCount": 1,
       "lastAccessed": 1776241486335,
-      "type": "file"
-    },
-    {
-      "path": "crates/storage/src/postgres.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776241503397,
       "type": "file"
     },
     {
@@ -260,18 +272,6 @@
       "path": "crates/storage/src/bin/ts_migrate.rs",
       "accessCount": 1,
       "lastAccessed": 1776241568863,
-      "type": "file"
-    },
-    {
-      "path": "infra/migrations/postgres/V001__instruments_and_accounts.sql",
-      "accessCount": 1,
-      "lastAccessed": 1776241582084,
-      "type": "file"
-    },
-    {
-      "path": "infra/migrations/postgres/V002__orders_and_fills.sql",
-      "accessCount": 1,
-      "lastAccessed": 1776241594932,
       "type": "file"
     },
     {
