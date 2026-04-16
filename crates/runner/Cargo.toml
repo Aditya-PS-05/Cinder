@@ -14,7 +14,7 @@ ts-oms.workspace = true
 ts-replay.workspace = true
 ts-strategy.workspace = true
 ts-binance.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time", "signal", "fs", "io-util"] }
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time", "signal", "fs", "io-util", "net"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true

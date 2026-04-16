@@ -22,6 +22,8 @@ pub struct PaperCfg {
     pub runner: RunnerCfg,
     #[serde(default)]
     pub audit: Option<AuditCfg>,
+    #[serde(default)]
+    pub metrics: Option<MetricsCfg>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -50,6 +52,12 @@ pub struct RunnerCfg {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuditCfg {
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MetricsCfg {
+    /// "host:port" address the scrape endpoint listens on.
+    pub listen: String,
 }
 
 impl Default for MarketCfg {

@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod metrics;
 pub mod paper_cfg;
 pub mod tape;
 
@@ -30,6 +31,7 @@ use ts_replay::{Replay, ReplaySummary};
 use ts_strategy::Strategy;
 
 use crate::audit::AuditEvent;
+use crate::metrics::RunnerMetrics;
 
 pub struct EngineRunner<S: Strategy> {
     replay: Replay<S>,
@@ -38,6 +40,7 @@ pub struct EngineRunner<S: Strategy> {
     summary_tx: Option<broadcast::Sender<ReplaySummary>>,
     summary_interval: Duration,
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
+    metrics: Option<Arc<RunnerMetrics>>,
 }
 
 /// Remote control for an [`EngineRunner`]. Dropping the handle does not
@@ -95,6 +98,7 @@ impl<S: Strategy> EngineRunner<S> {
             summary_tx,
             summary_interval: interval,
             audit_tx: None,
+            metrics: None,
         };
         (runner, handle)
     }
@@ -109,6 +113,16 @@ impl<S: Strategy> EngineRunner<S> {
     /// [`Fill`]: ts_core::Fill
     pub fn with_audit(mut self, audit_tx: mpsc::Sender<AuditEvent>) -> Self {
         self.audit_tx = Some(audit_tx);
+        self
+    }
+
+    /// Attach a [`RunnerMetrics`] snapshot the runner updates after
+    /// every processed event. Pair with
+    /// [`metrics::spawn_metrics_server`] to expose `/metrics` over
+    /// HTTP. The `Arc` is shared with the scrape endpoint, so both
+    /// see the same cumulative counters.
+    pub fn with_metrics(mut self, metrics: Arc<RunnerMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -163,6 +177,9 @@ impl<S: Strategy> EngineRunner<S> {
                             warn!(error = ?err, "runner: book error, dropping event");
                         }
                     }
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.observe(&self.replay.summary());
+                    }
                 }
                 _ = async {
                     match interval_ticker.as_mut() {
@@ -171,12 +188,22 @@ impl<S: Strategy> EngineRunner<S> {
                     }
                 } => {
                     if let Some(tx) = self.summary_tx.as_ref() {
-                        let _ = tx.send(self.replay.summary());
+                        let snap = self.replay.summary();
+                        if let Some(m) = self.metrics.as_ref() {
+                            m.observe(&snap);
+                        }
+                        let _ = tx.send(snap);
+                    } else if let Some(m) = self.metrics.as_ref() {
+                        m.observe(&self.replay.summary());
                     }
                 }
             }
         }
-        self.replay.summary()
+        let final_summary = self.replay.summary();
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe(&final_summary);
+        }
+        final_summary
     }
 }
 
@@ -413,5 +440,33 @@ mod tests {
         handle.shutdown();
         let summary = task.await.unwrap();
         assert_eq!(summary.metrics.events_ingested, 2);
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_tracks_processed_events() {
+        use crate::metrics::RunnerMetrics;
+
+        let (tx, rx) = mpsc::channel(16);
+        let metrics = RunnerMetrics::new();
+        let (runner, handle) = EngineRunner::new(build_replay(), rx);
+        let runner = runner.with_metrics(Arc::clone(&metrics));
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(100, 110, 1)).await.unwrap();
+        tx.send(snapshot(101, 111, 2)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        let text = metrics.encode_prometheus();
+        assert!(
+            text.contains("ts_events_ingested_total 2"),
+            "expected 2 ingested events, got:\n{text}"
+        );
+        assert!(
+            text.contains("ts_book_updates_total 2"),
+            "expected 2 book updates, got:\n{text}"
+        );
     }
 }

@@ -10,3 +10,6 @@ runner:
 
 audit:
   path: ./paper-audit.ndjson
+
+metrics:
+  listen: 0.0.0.0:9898

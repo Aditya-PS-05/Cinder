@@ -33,7 +33,8 @@ use ts_replay::{Replay, ReplaySummary};
 use ts_runner::{
     audit::{spawn_audit_writer, AuditWriter},
     bridge_bus,
-    paper_cfg::{AuditCfg, PaperCfg},
+    metrics::{spawn_metrics_server, RunnerMetrics},
+    paper_cfg::{AuditCfg, MetricsCfg, PaperCfg},
     EngineRunner,
 };
 use ts_strategy::{InventorySkewMaker, MakerConfig};
@@ -101,6 +102,12 @@ struct Cli {
     /// the YAML `audit.path` when set.
     #[arg(long)]
     audit: Option<PathBuf>,
+
+    /// Listen address for the Prometheus `/metrics` scrape endpoint
+    /// (e.g. `127.0.0.1:9898`). Overrides the YAML `metrics.listen`
+    /// when set. Omit to disable.
+    #[arg(long)]
+    metrics_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -164,6 +171,9 @@ fn resolve_config(cli: &Cli) -> Result<PaperCfg> {
     if let Some(path) = cli.audit.clone() {
         cfg.audit = Some(AuditCfg { path });
     }
+    if let Some(listen) = cli.metrics_addr.clone() {
+        cfg.metrics = Some(MetricsCfg { listen });
+    }
 
     Ok(cfg)
 }
@@ -215,6 +225,23 @@ async fn run(cfg: PaperCfg) -> Result<()> {
     let summary_interval = Duration::from_secs(cfg.runner.summary_secs);
     let (mut runner, handle) = EngineRunner::with_summary_tap(replay, rx, summary_interval, 8);
 
+    let metrics_server = if let Some(mcfg) = cfg.metrics.as_ref() {
+        let addr: std::net::SocketAddr = mcfg
+            .listen
+            .parse()
+            .with_context(|| format!("parse metrics.listen `{}`", mcfg.listen))?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind metrics listener on {addr}"))?;
+        let actual = listener.local_addr().context("metrics local_addr")?;
+        let metrics = RunnerMetrics::new();
+        runner = runner.with_metrics(Arc::clone(&metrics));
+        tracing::info!(addr = %actual, "metrics endpoint /metrics ready");
+        Some(spawn_metrics_server(listener, metrics))
+    } else {
+        None
+    };
+
     let audit_task = if let Some(audit_cfg) = cfg.audit.as_ref() {
         let writer = AuditWriter::create(&audit_cfg.path)
             .await
@@ -256,6 +283,9 @@ async fn run(cfg: PaperCfg) -> Result<()> {
     if let Some(p) = printer {
         p.abort();
     }
+    if let Some(srv) = metrics_server.as_ref() {
+        srv.abort();
+    }
 
     let summary = runner_task.await.context("runner task")?;
     if let Some(task) = audit_task {
@@ -263,6 +293,9 @@ async fn run(cfg: PaperCfg) -> Result<()> {
             Ok(written) => tracing::info!(events = written, "audit log flushed"),
             Err(err) => tracing::error!(error = %err, "audit task join failed"),
         }
+    }
+    if let Some(task) = metrics_server {
+        let _ = task.await;
     }
     log_summary(&symbol_str, "final", &summary);
     Ok(())
