@@ -2041,6 +2041,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts-replay"
+version = "0.1.0"
+dependencies = [
+ "ts-book",
+ "ts-core",
+ "ts-oms",
+ "ts-pnl",
+ "ts-strategy",
+]
+
+[[package]]
 name = "ts-risk"
 version = "0.1.0"
 dependencies = [

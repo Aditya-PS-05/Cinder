@@ -50,6 +50,7 @@ ts-paper = { path = "crates/paper" }
 ts-strategy = { path = "crates/strategy" }
 ts-oms = { path = "crates/oms" }
 ts-pnl = { path = "crates/pnl" }
+ts-replay = { path = "crates/replay" }
 
 [profile.release]
 lto = "thin"

@@ -34,7 +34,8 @@ use ts_core::{
     Price, Qty, Side, Symbol, Timestamp, Venue,
 };
 use ts_paper::PaperExecutor;
-use ts_risk::{RiskConfig, RiskEngine};
+use ts_risk::RiskEngine;
+pub use ts_risk::{RiskConfig, RiskRejection};
 use ts_strategy::{is_terminal, Strategy, StrategyAction};
 
 #[derive(Clone, Debug)]
