@@ -2034,6 +2034,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts-pnl"
+version = "0.1.0"
+dependencies = [
+ "ts-core",
+]
+
+[[package]]
 name = "ts-risk"
 version = "0.1.0"
 dependencies = [
