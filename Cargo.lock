@@ -2075,8 +2075,12 @@ dependencies = [
 name = "ts-runner"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "ts-binance",
  "ts-core",
  "ts-oms",
  "ts-replay",

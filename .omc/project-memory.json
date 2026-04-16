@@ -120,20 +120,32 @@
     },
     {
       "path": "crates/core/src/lib.rs",
-      "accessCount": 4,
-      "lastAccessed": 1776310606553,
+      "accessCount": 5,
+      "lastAccessed": 1776313589996,
       "type": "file"
     },
     {
       "path": "crates/binance/src/lib.rs",
-      "accessCount": 3,
-      "lastAccessed": 1776243140144,
+      "accessCount": 4,
+      "lastAccessed": 1776313584746,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/spot.rs",
+      "accessCount": 4,
+      "lastAccessed": 1776313593913,
       "type": "file"
     },
     {
       "path": "crates/binance/Cargo.toml",
       "accessCount": 3,
       "lastAccessed": 1776243143512,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/bin/ts_md_binance.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776313569732,
       "type": "file"
     },
     {
@@ -215,21 +227,9 @@
       "type": "file"
     },
     {
-      "path": "crates/binance/src/spot.rs",
-      "accessCount": 2,
-      "lastAccessed": 1776312660733,
-      "type": "file"
-    },
-    {
       "path": "crates/core/src/bus.rs",
       "accessCount": 2,
       "lastAccessed": 1776312666759,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/bin/ts_md_binance.rs",
-      "accessCount": 2,
-      "lastAccessed": 1776312667069,
       "type": "file"
     },
     {
@@ -239,15 +239,21 @@
       "type": "file"
     },
     {
-      "path": "infra/compose/docker-compose.yml",
-      "accessCount": 1,
-      "lastAccessed": 1776241028296,
+      "path": "crates/config/src/lib.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776313565915,
       "type": "file"
     },
     {
-      "path": "crates/config/src/lib.rs",
+      "path": "crates/core/src/venue.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776313652584,
+      "type": "file"
+    },
+    {
+      "path": "infra/compose/docker-compose.yml",
       "accessCount": 1,
-      "lastAccessed": 1776241118682,
+      "lastAccessed": 1776241028296,
       "type": "file"
     },
     {
@@ -332,12 +338,6 @@
       "path": "infra/migrations/clickhouse/V005__liquidations.sql",
       "accessCount": 1,
       "lastAccessed": 1776241630225,
-      "type": "file"
-    },
-    {
-      "path": "crates/core/src/venue.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776242367132,
       "type": "file"
     },
     {
