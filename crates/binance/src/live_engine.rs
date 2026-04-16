@@ -145,6 +145,15 @@ impl<A: BinanceOrderApi> BinanceLiveEngine<A> {
         &self.cache
     }
 
+    /// Clone of the inbound [`ExecReport`] sender. External producers —
+    /// typically a [`crate::user_stream::UserDataStreamClient`] — push
+    /// venue-side order updates here so they land in the same queue
+    /// that [`OrderEngine::reconcile`] drains. This is what lets live
+    /// fills flow from Binance's WebSocket back into the engine.
+    pub fn inbound_sender(&self) -> mpsc::Sender<ExecReport> {
+        self.tx.clone()
+    }
+
     fn spec_for(&self, sym: &Symbol) -> Result<&InstrumentSpec, LiveEngineError> {
         self.specs
             .get(sym)

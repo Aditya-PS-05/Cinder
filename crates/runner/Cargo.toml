@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 ts-core = { workspace = true, features = ["serde"] }
+ts-book.workspace = true
 ts-config.workspace = true
 ts-oms.workspace = true
 ts-replay.workspace = true
@@ -28,6 +29,10 @@ tokio = { workspace = true, features = ["test-util"] }
 [[bin]]
 name = "ts-paper-run"
 path = "src/bin/ts_paper_run.rs"
+
+[[bin]]
+name = "ts-live-run"
+path = "src/bin/ts_live_run.rs"
 
 [[bin]]
 name = "ts-tape"

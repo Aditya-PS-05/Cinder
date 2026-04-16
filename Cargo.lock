@@ -2090,6 +2090,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-binance",
+ "ts-book",
  "ts-config",
  "ts-core",
  "ts-oms",

@@ -15,6 +15,8 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod live;
+pub mod live_cfg;
 pub mod metrics;
 pub mod paper_cfg;
 pub mod tape;

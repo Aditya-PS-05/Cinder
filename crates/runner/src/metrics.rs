@@ -24,6 +24,8 @@ use tokio::task::JoinHandle;
 
 use ts_replay::ReplaySummary;
 
+use crate::live::LiveSummary;
+
 /// Lock-free view of the runner's cumulative state.
 #[derive(Debug, Default)]
 pub struct RunnerMetrics {
@@ -84,6 +86,26 @@ impl RunnerMetrics {
                 self.mark_known.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Observe counters from a [`LiveSummary`]. The live path doesn't
+    /// maintain its own PnL (that lives in the strategy / a separate
+    /// PnL module), so position, PnL, and mark are left untouched.
+    pub fn observe_live(&self, summary: &LiveSummary) {
+        self.events_ingested
+            .store(summary.events_ingested, Ordering::Relaxed);
+        self.book_updates
+            .store(summary.book_updates, Ordering::Relaxed);
+        self.orders_submitted
+            .store(summary.orders_submitted, Ordering::Relaxed);
+        self.orders_new.store(summary.orders_new, Ordering::Relaxed);
+        self.orders_filled
+            .store(summary.orders_filled, Ordering::Relaxed);
+        self.orders_canceled
+            .store(summary.orders_canceled, Ordering::Relaxed);
+        self.orders_rejected
+            .store(summary.orders_rejected, Ordering::Relaxed);
+        self.fills.store(summary.fills, Ordering::Relaxed);
     }
 
     /// Render the current snapshot in Prometheus text exposition
