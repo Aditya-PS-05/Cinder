@@ -142,6 +142,9 @@ impl<E: OrderEngine> LiveRunner<E> {
                         debug!("live-runner: event channel closed");
                         break;
                     };
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.observe_event(&event);
+                    }
                     self.handle_market_event(event).await;
                 }
                 _ = reconcile.tick() => {

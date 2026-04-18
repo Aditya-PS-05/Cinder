@@ -154,6 +154,9 @@ impl<S: Strategy> EngineRunner<S> {
                         debug!("runner: event channel closed");
                         break;
                     };
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.observe_event(&event);
+                    }
                     match self.replay.step(&event) {
                         Ok(step) => {
                             if let Some(tx) = self.audit_tx.as_ref() {

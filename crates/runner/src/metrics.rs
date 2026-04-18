@@ -22,9 +22,65 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+use ts_core::MarketEvent;
 use ts_replay::ReplaySummary;
 
 use crate::live::LiveSummary;
+
+/// Cumulative nanosecond bucket boundaries used by every latency
+/// histogram the runner exposes. Cumulative encoding is computed at
+/// render time; each atomic bucket counts observations that fell in
+/// its exclusive upper-bound slot.
+const LATENCY_BUCKETS_NS: [u64; 11] = [
+    10_000,        // 10 μs
+    50_000,        // 50 μs
+    100_000,       // 100 μs
+    500_000,       // 500 μs
+    1_000_000,     // 1 ms
+    5_000_000,     // 5 ms
+    10_000_000,    // 10 ms
+    50_000_000,    // 50 ms
+    100_000_000,   // 100 ms
+    500_000_000,   // 500 ms
+    1_000_000_000, // 1 s
+];
+
+/// Lock-free histogram over [`LATENCY_BUCKETS_NS`] plus a `+Inf` bucket.
+/// Negative samples are floored to zero (they fall in the first bucket).
+/// `sum` is a saturating unsigned total of observed nanoseconds.
+#[derive(Debug, Default)]
+pub struct LatencyHistogram {
+    buckets: [AtomicU64; 12],
+    sum: AtomicU64,
+    count: AtomicU64,
+}
+
+impl LatencyHistogram {
+    fn observe(&self, nanos: i64) {
+        let v = nanos.max(0) as u64;
+        let idx = LATENCY_BUCKETS_NS
+            .iter()
+            .position(|b| v <= *b)
+            .unwrap_or(LATENCY_BUCKETS_NS.len());
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(v, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn encode(&self, out: &mut String, name: &str, help: &str) {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        let mut cumulative: u64 = 0;
+        for (i, bound) in LATENCY_BUCKETS_NS.iter().enumerate() {
+            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+        }
+        cumulative += self.buckets[LATENCY_BUCKETS_NS.len()].load(Ordering::Relaxed);
+        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+        let _ = writeln!(out, "{name}_sum {}", self.sum.load(Ordering::Relaxed));
+        let _ = writeln!(out, "{name}_count {cumulative}");
+    }
+}
 
 /// Lock-free view of the runner's cumulative state.
 #[derive(Debug, Default)]
@@ -44,6 +100,11 @@ pub struct RunnerMetrics {
     total_pnl: AtomicI64,
     mark_price: AtomicI64,
     mark_known: AtomicU64,
+
+    /// `local_ts - exchange_ts` per observed event. Captures the
+    /// WS → decoder → runner leg; ignores events the venue did not
+    /// stamp (both timestamps must be set for the sample to count).
+    ingest_latency_nanos: LatencyHistogram,
 }
 
 impl RunnerMetrics {
@@ -86,6 +147,17 @@ impl RunnerMetrics {
                 self.mark_known.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Record a single [`MarketEvent`]'s exchange→local latency into the
+    /// `ingest_latency_nanos` histogram. Events missing either timestamp
+    /// are skipped so unstamped fixtures don't pollute the distribution
+    /// with a flood of zeroes.
+    pub fn observe_event(&self, event: &MarketEvent) {
+        if event.exchange_ts.is_unset() || event.local_ts.is_unset() {
+            return;
+        }
+        self.ingest_latency_nanos.observe(event.latency_nanos());
     }
 
     /// Observe counters from a [`LiveSummary`]. The live path doesn't
@@ -193,6 +265,11 @@ impl RunnerMetrics {
                 self.mark_price.load(Ordering::Relaxed),
             );
         }
+        self.ingest_latency_nanos.encode(
+            &mut out,
+            "ts_ingest_latency_nanos",
+            "Exchange→local delivery latency per market event (nanoseconds).",
+        );
         out
     }
 }
@@ -330,6 +407,67 @@ mod tests {
                 "expected body to contain `{needle}`, got:\n{body}"
             );
         }
+    }
+
+    #[test]
+    fn histogram_encodes_cumulative_buckets_and_count() {
+        use ts_core::{BookSnapshot, MarketEvent, MarketPayload, Symbol, Timestamp, Venue};
+        let m = RunnerMetrics::new();
+        let mk = |exch: i64, local: i64| MarketEvent {
+            venue: Venue::BINANCE,
+            symbol: Symbol::from_static("BTCUSDT"),
+            exchange_ts: Timestamp(exch),
+            local_ts: Timestamp(local),
+            seq: 1,
+            payload: MarketPayload::BookSnapshot(BookSnapshot::default()),
+        };
+        // 500 ns → first bucket (<=10 μs).
+        m.observe_event(&mk(1_000, 1_500));
+        // 60 μs → <=100 μs bucket (skips <=10 μs and <=50 μs).
+        m.observe_event(&mk(1_000, 61_000));
+        // 2 ms → <=5 ms bucket.
+        m.observe_event(&mk(1_000, 2_001_000));
+
+        let body = m.encode_prometheus();
+        assert!(
+            body.contains("ts_ingest_latency_nanos_bucket{le=\"10000\"} 1"),
+            "first bucket should hold the 500 ns sample, got:\n{body}"
+        );
+        assert!(
+            body.contains("ts_ingest_latency_nanos_bucket{le=\"100000\"} 2"),
+            "cumulative count at 100 μs should include both sub-μs and 60 μs, got:\n{body}"
+        );
+        assert!(
+            body.contains("ts_ingest_latency_nanos_bucket{le=\"+Inf\"} 3"),
+            "+Inf bucket should see every sample, got:\n{body}"
+        );
+        assert!(
+            body.contains("ts_ingest_latency_nanos_count 3"),
+            "count line missing, got:\n{body}"
+        );
+        assert!(
+            body.contains("ts_ingest_latency_nanos_sum 2060500"),
+            "sum should be 500 + 60_000 + 2_000_000 ns, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn histogram_skips_events_without_timestamps() {
+        use ts_core::{BookSnapshot, MarketEvent, MarketPayload, Symbol, Timestamp, Venue};
+        let m = RunnerMetrics::new();
+        m.observe_event(&MarketEvent {
+            venue: Venue::BINANCE,
+            symbol: Symbol::from_static("BTCUSDT"),
+            exchange_ts: Timestamp::default(),
+            local_ts: Timestamp::default(),
+            seq: 1,
+            payload: MarketPayload::BookSnapshot(BookSnapshot::default()),
+        });
+        let body = m.encode_prometheus();
+        assert!(
+            body.contains("ts_ingest_latency_nanos_count 0"),
+            "unstamped events must not count, got:\n{body}"
+        );
     }
 
     #[test]
