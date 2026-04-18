@@ -285,6 +285,7 @@ async fn run(cfg: LiveCfg) -> Result<()> {
 
     let mut ws_cfg = SpotStreamConfig::new(vec![symbol_str.clone()], specs.clone());
     ws_cfg.ws_url = cfg.market.ws_url.clone();
+    ws_cfg.rest_base = cfg.binance.rest_base.clone();
     let md_client = Arc::new(SpotStreamClient::new(ws_cfg, Arc::clone(&bus)));
     let md_for_task = Arc::clone(&md_client);
     let md_task = tokio::spawn(async move { md_for_task.run().await });

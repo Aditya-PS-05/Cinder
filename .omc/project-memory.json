@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1776338994064,
+  "lastScanned": 1776538830168,
   "projectRoot": "/home/aditya/my-work/something/trading-system",
   "techStack": {
     "languages": [
@@ -50,7 +50,7 @@
       "path": "config",
       "purpose": "Configuration files",
       "fileCount": 4,
-      "lastAccessed": 1776338994056,
+      "lastAccessed": 1776538830123,
       "keyFiles": [
         "base.yaml",
         "dev.yaml",
@@ -62,35 +62,35 @@
       "path": "configs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776338994060,
+      "lastAccessed": 1776538830133,
       "keyFiles": []
     },
     "crates": {
       "path": "crates",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776338994061,
+      "lastAccessed": 1776538830135,
       "keyFiles": []
     },
     "infra": {
       "path": "infra",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776338994061,
+      "lastAccessed": 1776538830135,
       "keyFiles": []
     },
     "ops": {
       "path": "ops",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776338994062,
+      "lastAccessed": 1776538830136,
       "keyFiles": []
     },
     "target": {
       "path": "target",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1776338994062,
+      "lastAccessed": 1776538830136,
       "keyFiles": [
         "CACHEDIR.TAG"
       ]
@@ -99,7 +99,7 @@
       "path": "crates/config",
       "purpose": "Configuration files",
       "fileCount": 1,
-      "lastAccessed": 1776338994063,
+      "lastAccessed": 1776538830143,
       "keyFiles": [
         "Cargo.toml"
       ]
@@ -108,7 +108,7 @@
       "path": "infra/migrations",
       "purpose": "Database migrations",
       "fileCount": 0,
-      "lastAccessed": 1776338994063,
+      "lastAccessed": 1776538830144,
       "keyFiles": []
     }
   },
@@ -121,8 +121,14 @@
     },
     {
       "path": "crates/binance/src/lib.rs",
-      "accessCount": 10,
-      "lastAccessed": 1776357615480,
+      "accessCount": 13,
+      "lastAccessed": 1776373243652,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/error.rs",
+      "accessCount": 11,
+      "lastAccessed": 1776373197789,
       "type": "file"
     },
     {
@@ -138,9 +144,9 @@
       "type": "file"
     },
     {
-      "path": "crates/binance/src/error.rs",
+      "path": "crates/binance/Cargo.toml",
       "accessCount": 9,
-      "lastAccessed": 1776357435215,
+      "lastAccessed": 1776373326405,
       "type": "file"
     },
     {
@@ -151,20 +157,14 @@
     },
     {
       "path": "crates/core/src/market.rs",
-      "accessCount": 7,
-      "lastAccessed": 1776314209892,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/Cargo.toml",
-      "accessCount": 7,
-      "lastAccessed": 1776355197572,
+      "accessCount": 8,
+      "lastAccessed": 1776373258186,
       "type": "file"
     },
     {
       "path": "crates/binance/src/spot.rs",
-      "accessCount": 5,
-      "lastAccessed": 1776357431855,
+      "accessCount": 8,
+      "lastAccessed": 1776373306224,
       "type": "file"
     },
     {
@@ -177,6 +177,18 @@
       "path": "crates/core/src/time.rs",
       "accessCount": 4,
       "lastAccessed": 1776357484530,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/decode.rs",
+      "accessCount": 4,
+      "lastAccessed": 1776372764658,
+      "type": "file"
+    },
+    {
+      "path": "crates/binance/src/rest.rs",
+      "accessCount": 4,
+      "lastAccessed": 1776373201734,
       "type": "file"
     },
     {
@@ -204,9 +216,9 @@
       "type": "file"
     },
     {
-      "path": "crates/binance/src/decode.rs",
+      "path": "crates/binance/src/book.rs",
       "accessCount": 3,
-      "lastAccessed": 1776357489533,
+      "lastAccessed": 1776372780731,
       "type": "file"
     },
     {
@@ -261,18 +273,6 @@
       "path": "crates/core/src/bus.rs",
       "accessCount": 2,
       "lastAccessed": 1776312666759,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/book.rs",
-      "accessCount": 2,
-      "lastAccessed": 1776312674173,
-      "type": "file"
-    },
-    {
-      "path": "crates/binance/src/rest.rs",
-      "accessCount": 2,
-      "lastAccessed": 1776338950543,
       "type": "file"
     },
     {

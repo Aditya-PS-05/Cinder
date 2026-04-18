@@ -20,6 +20,7 @@ pub mod error;
 pub mod live_engine;
 pub mod order_rest;
 pub mod rest;
+pub mod resync;
 pub mod spot;
 pub mod user_stream;
 
@@ -31,6 +32,7 @@ pub use order_rest::{
     OrderType, QueryOrderRequest, Side, SignedClient, TimeInForce, MAINNET_BASE, TESTNET_BASE,
 };
 pub use rest::{fetch_depth_snapshot, parse_depth_snapshot, DepthSnapshot};
+pub use resync::{AlignError, AlignState, PushOutcome, SymbolResync};
 pub use spot::{SpotStreamClient, SpotStreamConfig};
 pub use user_stream::{
     decode_execution_report, decode_user_stream_frame, UserDataStreamClient, UserDataStreamConfig,
