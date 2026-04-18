@@ -24,6 +24,50 @@ pub struct LiveCfg {
     pub audit: Option<AuditCfg>,
     #[serde(default)]
     pub metrics: Option<MetricsCfg>,
+    #[serde(default)]
+    pub kill_switch: Option<KillSwitchCfg>,
+}
+
+/// Optional kill-switch wiring for the live runner. A missing section
+/// leaves the runner with no switch attached; an empty section enables
+/// defaults (reject-rate trigger only, no halt-file watcher).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KillSwitchCfg {
+    /// Filesystem path polled by the halt-file watcher. Creating the
+    /// file (e.g. `touch /tmp/ts-halt`) trips the switch. Omit to leave
+    /// manual halt unmonitored.
+    #[serde(default)]
+    pub halt_file: Option<PathBuf>,
+    /// Rejects inside `window_ms` that force the switch to trip.
+    #[serde(default = "default_reject_threshold")]
+    pub reject_threshold: u32,
+    /// Sliding reject-window horizon, in milliseconds.
+    #[serde(default = "default_window_ms")]
+    pub window_ms: u64,
+    /// Halt-file polling cadence, in milliseconds.
+    #[serde(default = "default_poll_ms")]
+    pub poll_ms: u64,
+}
+
+impl Default for KillSwitchCfg {
+    fn default() -> Self {
+        Self {
+            halt_file: None,
+            reject_threshold: default_reject_threshold(),
+            window_ms: default_window_ms(),
+            poll_ms: default_poll_ms(),
+        }
+    }
+}
+
+fn default_reject_threshold() -> u32 {
+    10
+}
+fn default_window_ms() -> u64 {
+    5_000
+}
+fn default_poll_ms() -> u64 {
+    250
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

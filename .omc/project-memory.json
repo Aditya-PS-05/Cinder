@@ -222,6 +222,12 @@
       "type": "file"
     },
     {
+      "path": "crates/risk/src/lib.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776539479853,
+      "type": "file"
+    },
+    {
       "path": "config/base.yaml",
       "accessCount": 2,
       "lastAccessed": 1776241639867,
@@ -399,12 +405,6 @@
       "path": "crates/risk/Cargo.toml",
       "accessCount": 1,
       "lastAccessed": 1776310157629,
-      "type": "file"
-    },
-    {
-      "path": "crates/risk/src/lib.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776310194584,
       "type": "file"
     },
     {

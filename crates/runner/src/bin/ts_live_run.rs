@@ -29,11 +29,13 @@ use ts_binance::{
 };
 use ts_config::Env;
 use ts_core::{bus::Bus, InstrumentSpec, MarketEvent, Qty, Symbol, Venue};
+use ts_risk::{KillSwitch, KillSwitchConfig};
 use ts_runner::{
     audit::{spawn_audit_writer, AuditWriter},
     bridge_bus,
+    kill_switch_watch::spawn_halt_file_watcher,
     live::{LiveRunner, LiveSummary},
-    live_cfg::LiveCfg,
+    live_cfg::{KillSwitchCfg, LiveCfg},
     metrics::{spawn_metrics_server, RunnerMetrics},
     paper_cfg::{AuditCfg, MetricsCfg},
 };
@@ -97,6 +99,11 @@ struct Cli {
     /// Listen address for `/metrics`, e.g. `127.0.0.1:9899`.
     #[arg(long)]
     metrics_addr: Option<String>,
+
+    /// Filesystem path whose appearance trips the kill switch
+    /// (`touch <path>` to halt trading).
+    #[arg(long)]
+    halt_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -171,6 +178,11 @@ fn resolve_config(cli: &Cli) -> Result<LiveCfg> {
     if let Some(listen) = cli.metrics_addr.clone() {
         cfg.metrics = Some(MetricsCfg { listen });
     }
+    if let Some(path) = cli.halt_file.clone() {
+        let mut ks = cfg.kill_switch.clone().unwrap_or_default();
+        ks.halt_file = Some(path);
+        cfg.kill_switch = Some(ks);
+    }
 
     Ok(cfg)
 }
@@ -244,6 +256,11 @@ async fn run(cfg: LiveCfg) -> Result<()> {
         builder = builder.summary_tap(summary_interval, 8);
     }
 
+    let (kill_switch, halt_watcher) = wire_kill_switch(cfg.kill_switch.as_ref());
+    if let Some(ks) = kill_switch.as_ref() {
+        builder = builder.kill_switch(Arc::clone(ks));
+    }
+
     let metrics_server = if let Some(mcfg) = cfg.metrics.as_ref() {
         let addr: std::net::SocketAddr = mcfg
             .listen
@@ -254,6 +271,9 @@ async fn run(cfg: LiveCfg) -> Result<()> {
             .with_context(|| format!("bind metrics listener on {addr}"))?;
         let actual = listener.local_addr().context("metrics local_addr")?;
         let metrics = RunnerMetrics::new();
+        if let Some(ks) = kill_switch.as_ref() {
+            metrics.observe_kill_switch(ks);
+        }
         builder = builder.metrics(Arc::clone(&metrics));
         tracing::info!(addr = %actual, "metrics endpoint /metrics ready");
         Some(spawn_metrics_server(listener, metrics))
@@ -310,6 +330,9 @@ async fn run(cfg: LiveCfg) -> Result<()> {
 
     md_task.abort();
     user_task.abort();
+    if let Some(w) = halt_watcher.as_ref() {
+        w.abort();
+    }
     bus.close();
     let _ = bridge.await;
     handle.shutdown();
@@ -332,6 +355,31 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     }
     log_summary(&symbol_str, "final", &summary);
     Ok(())
+}
+
+/// Build the optional shared [`KillSwitch`] from config and, if a
+/// `halt_file` path is set, spawn the filesystem watcher that trips it
+/// when the file appears. Returns the switch handle and the watcher's
+/// join-handle (so `main` can abort it during shutdown). A missing
+/// `kill_switch` section leaves the runner without a switch attached.
+fn wire_kill_switch(
+    cfg: Option<&KillSwitchCfg>,
+) -> (Option<Arc<KillSwitch>>, Option<tokio::task::JoinHandle<()>>) {
+    let Some(cfg) = cfg else {
+        return (None, None);
+    };
+    let ks = Arc::new(KillSwitch::new(KillSwitchConfig {
+        reject_threshold: cfg.reject_threshold,
+        window: Duration::from_millis(cfg.window_ms),
+    }));
+    let watcher = cfg.halt_file.as_ref().map(|path| {
+        spawn_halt_file_watcher(
+            Arc::clone(&ks),
+            path.clone(),
+            Duration::from_millis(cfg.poll_ms),
+        )
+    });
+    (Some(ks), watcher)
 }
 
 fn log_summary(symbol: &str, tag: &str, s: &LiveSummary) {

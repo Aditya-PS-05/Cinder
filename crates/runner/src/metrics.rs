@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 
 use ts_core::MarketEvent;
 use ts_replay::ReplaySummary;
+use ts_risk::KillSwitch;
 
 use crate::live::LiveSummary;
 
@@ -101,6 +102,9 @@ pub struct RunnerMetrics {
     mark_price: AtomicI64,
     mark_known: AtomicU64,
 
+    kill_switch_tripped: AtomicU64,
+    kill_switch_reason: AtomicU64,
+
     /// `local_ts - exchange_ts` per observed event. Captures the
     /// WS → decoder → runner leg; ignores events the venue did not
     /// stamp (both timestamps must be set for the sample to count).
@@ -147,6 +151,21 @@ impl RunnerMetrics {
                 self.mark_known.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Publish the current state of a [`KillSwitch`] into the
+    /// `ts_kill_switch_tripped` gauge (1 when tripped, 0 when armed) and
+    /// `ts_kill_switch_reason` (numeric trip-reason code, 0 = armed).
+    pub fn observe_kill_switch(&self, ks: &KillSwitch) {
+        self.kill_switch_tripped
+            .store(if ks.tripped() { 1 } else { 0 }, Ordering::Relaxed);
+        let code = match ks.reason() {
+            Some(ts_risk::TripReason::RejectRate) => 1,
+            Some(ts_risk::TripReason::Manual) => 2,
+            Some(ts_risk::TripReason::External) => 3,
+            None => 0,
+        };
+        self.kill_switch_reason.store(code, Ordering::Relaxed);
     }
 
     /// Record a single [`MarketEvent`]'s exchange→local latency into the
@@ -265,6 +284,18 @@ impl RunnerMetrics {
                 self.mark_price.load(Ordering::Relaxed),
             );
         }
+        gauge(
+            &mut out,
+            "ts_kill_switch_tripped",
+            "1 if the runner's kill switch has tripped, 0 otherwise.",
+            self.kill_switch_tripped.load(Ordering::Relaxed) as i64,
+        );
+        gauge(
+            &mut out,
+            "ts_kill_switch_reason",
+            "Trip reason: 0 armed, 1 reject-rate, 2 manual, 3 external.",
+            self.kill_switch_reason.load(Ordering::Relaxed) as i64,
+        );
         self.ingest_latency_nanos.encode(
             &mut out,
             "ts_ingest_latency_nanos",

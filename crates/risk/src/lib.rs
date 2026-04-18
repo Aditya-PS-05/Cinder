@@ -9,6 +9,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod kill_switch;
+pub use kill_switch::{KillSwitch, KillSwitchConfig, TripReason};
+
 use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;

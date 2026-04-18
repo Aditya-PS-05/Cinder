@@ -2107,6 +2107,7 @@ dependencies = [
  "ts-core",
  "ts-oms",
  "ts-replay",
+ "ts-risk",
  "ts-strategy",
 ]
 

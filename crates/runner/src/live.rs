@@ -29,6 +29,7 @@ use tracing::{debug, error, warn};
 use ts_book::OrderBook;
 use ts_core::{ExecReport, Fill, MarketEvent, MarketPayload};
 use ts_oms::OrderEngine;
+use ts_risk::KillSwitch;
 use ts_strategy::{Strategy, StrategyAction};
 
 use crate::audit::AuditEvent;
@@ -64,6 +65,7 @@ pub struct LiveRunner<E: OrderEngine> {
     summary_interval: Duration,
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
     metrics: Option<Arc<RunnerMetrics>>,
+    kill_switch: Option<Arc<KillSwitch>>,
     summary: LiveSummary,
 }
 
@@ -108,6 +110,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             summary_capacity: 0,
             audit_tx: None,
             metrics: None,
+            kill_switch: None,
         }
     }
 
@@ -196,7 +199,12 @@ impl<E: OrderEngine> LiveRunner<E> {
         }
 
         let actions = self.strategy.on_book_update(event.local_ts, &self.book);
+        let halted = self.kill_switch.as_ref().is_some_and(|ks| ks.tripped());
         for action in actions {
+            if halted {
+                warn!("live-runner: kill switch tripped; dropping strategy action");
+                continue;
+            }
             match action {
                 StrategyAction::Place(order) => {
                     self.summary.orders_submitted += 1;
@@ -242,7 +250,14 @@ impl<E: OrderEngine> LiveRunner<E> {
             OrderStatus::New => self.summary.orders_new += 1,
             OrderStatus::Filled => self.summary.orders_filled += 1,
             OrderStatus::Canceled => self.summary.orders_canceled += 1,
-            OrderStatus::Rejected => self.summary.orders_rejected += 1,
+            OrderStatus::Rejected => {
+                self.summary.orders_rejected += 1;
+                if let Some(ks) = self.kill_switch.as_ref() {
+                    if ks.record_reject(std::time::Instant::now()) {
+                        error!("live-runner: kill switch tripped on reject rate");
+                    }
+                }
+            }
             OrderStatus::Expired => self.summary.orders_expired += 1,
             OrderStatus::PartiallyFilled => {}
         }
@@ -275,6 +290,9 @@ impl<E: OrderEngine> LiveRunner<E> {
     fn observe_metrics(&self) {
         if let Some(m) = self.metrics.as_ref() {
             m.observe_live(&self.summary);
+            if let Some(ks) = self.kill_switch.as_ref() {
+                m.observe_kill_switch(ks);
+            }
         }
     }
 }
@@ -288,6 +306,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     summary_capacity: usize,
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
     metrics: Option<Arc<RunnerMetrics>>,
+    kill_switch: Option<Arc<KillSwitch>>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -309,6 +328,15 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
 
     pub fn metrics(mut self, m: Arc<RunnerMetrics>) -> Self {
         self.metrics = Some(m);
+        self
+    }
+
+    /// Attach a process-wide [`KillSwitch`]. When `tripped()` returns
+    /// true, every subsequent strategy submit/cancel is dropped on the
+    /// floor with a warn-level log, and venue-side `OrderStatus::Rejected`
+    /// reports feed the switch's reject-rate window.
+    pub fn kill_switch(mut self, ks: Arc<KillSwitch>) -> Self {
+        self.kill_switch = Some(ks);
         self
     }
 
@@ -334,6 +362,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             summary_interval: self.summary_interval,
             audit_tx: self.audit_tx,
             metrics: self.metrics,
+            kill_switch: self.kill_switch,
             summary: LiveSummary::default(),
         };
         (runner, handle)
