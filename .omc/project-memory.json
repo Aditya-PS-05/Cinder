@@ -168,6 +168,12 @@
       "type": "file"
     },
     {
+      "path": "crates/book/src/lib.rs",
+      "accessCount": 7,
+      "lastAccessed": 1776569757881,
+      "type": "file"
+    },
+    {
       "path": "crates/core/src/decimal.rs",
       "accessCount": 6,
       "lastAccessed": 1776564012463,
@@ -189,12 +195,6 @@
       "path": "crates/storage/src/lib.rs",
       "accessCount": 5,
       "lastAccessed": 1776564120271,
-      "type": "file"
-    },
-    {
-      "path": "crates/book/src/lib.rs",
-      "accessCount": 5,
-      "lastAccessed": 1776565230458,
       "type": "file"
     },
     {

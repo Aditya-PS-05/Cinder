@@ -18,6 +18,9 @@ use thiserror::Error;
 
 use ts_core::{BookDelta, BookLevel, BookSnapshot, Price, Qty};
 
+pub mod vol;
+pub use vol::EwmaVol;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BookError {
     #[error("order book has not been initialized with a snapshot")]
