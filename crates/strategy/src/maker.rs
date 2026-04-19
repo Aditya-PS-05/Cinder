@@ -18,6 +18,34 @@ use ts_core::{
 
 use crate::{is_terminal, Strategy, StrategyAction};
 
+/// Running counts of why the maker quoted (or didn't) on each tick.
+///
+/// The maker has three gates that can silently drop a side:
+///
+///   * `suppressed_cap`   — inventory is at or beyond `max_inventory`
+///     on the side we'd be accumulating.
+///   * `suppressed_cross` — the computed price would cross the book
+///     and execute as a taker (see the Phase 45 cross guard).
+///   * `suppressed_price` — the computed price is non-positive (the
+///     stacked widening / skew math underflowed past zero).
+///
+/// `quotes_posted` is the count of `Place` actions emitted — every
+/// tick that places both sides bumps this by two. Suppression counts
+/// are per-side as well, so the per-side numbers sum to
+/// `2 * ticks_with_valid_book` minus one-sided empty-book ticks.
+///
+/// Public so operators can ask a running maker "what are you doing?"
+/// without plumbing metrics through the Strategy trait; future
+/// observability phases can surface these through Prometheus / the
+/// ReplaySummary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuoteGateCounters {
+    pub quotes_posted: u64,
+    pub suppressed_cap: u64,
+    pub suppressed_cross: u64,
+    pub suppressed_price: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct MakerConfig {
     pub venue: Venue,
@@ -65,6 +93,7 @@ pub struct InventorySkewMaker {
     open_bid: Option<ClientOrderId>,
     open_ask: Option<ClientOrderId>,
     cid_counter: u64,
+    counters: QuoteGateCounters,
 }
 
 impl InventorySkewMaker {
@@ -77,7 +106,13 @@ impl InventorySkewMaker {
             open_bid: None,
             open_ask: None,
             cid_counter: 0,
+            counters: QuoteGateCounters::default(),
         }
+    }
+
+    /// Snapshot of the per-reason gate counters since construction.
+    pub fn counters(&self) -> QuoteGateCounters {
+        self.counters
     }
 
     pub fn inventory(&self) -> i64 {
@@ -196,16 +231,35 @@ impl Strategy for InventorySkewMaker {
         let bid_would_cross = bid_px >= best_ask_px;
         let ask_would_cross = ask_px <= best_bid_px;
 
-        if !at_long_cap && bid_px > 0 && !bid_would_cross {
+        // Gate ordering matches the precedence we want the counters to
+        // reflect: cap fires first (strategy decision), then cross
+        // (market-structure safety), then price (numeric sanity). Each
+        // suppressed side bumps exactly one counter so the totals
+        // stay disjoint and easy to reason about.
+        if at_long_cap {
+            self.counters.suppressed_cap += 1;
+        } else if bid_would_cross {
+            self.counters.suppressed_cross += 1;
+        } else if bid_px <= 0 {
+            self.counters.suppressed_price += 1;
+        } else {
             let (cid, order) = self.build_order(Side::Buy, Price(bid_px), "b", now);
             self.open_bid = Some(cid);
             actions.push(StrategyAction::Place(order));
+            self.counters.quotes_posted += 1;
         }
 
-        if !at_short_cap && ask_px > 0 && !ask_would_cross {
+        if at_short_cap {
+            self.counters.suppressed_cap += 1;
+        } else if ask_would_cross {
+            self.counters.suppressed_cross += 1;
+        } else if ask_px <= 0 {
+            self.counters.suppressed_price += 1;
+        } else {
             let (cid, order) = self.build_order(Side::Sell, Price(ask_px), "a", now);
             self.open_ask = Some(cid);
             actions.push(StrategyAction::Place(order));
+            self.counters.quotes_posted += 1;
         }
 
         actions
@@ -803,5 +857,112 @@ mod tests {
         f.symbol = Symbol::from_static("ETHUSDT");
         m.on_fill(&f);
         assert_eq!(m.inventory(), 0);
+    }
+
+    #[test]
+    fn fresh_maker_reports_zeroed_counters() {
+        let m = InventorySkewMaker::new(cfg());
+        assert_eq!(m.counters(), QuoteGateCounters::default());
+    }
+
+    #[test]
+    fn clean_two_sided_tick_bumps_quotes_posted_by_two() {
+        let mut m = InventorySkewMaker::new(cfg());
+        let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
+        m.on_book_update(Timestamp::default(), &book);
+        let c = m.counters();
+        assert_eq!(c.quotes_posted, 2);
+        assert_eq!(c.suppressed_cap, 0);
+        assert_eq!(c.suppressed_cross, 0);
+        assert_eq!(c.suppressed_price, 0);
+    }
+
+    #[test]
+    fn inventory_cap_bumps_suppressed_cap_counter() {
+        let mut c = cfg();
+        c.inventory_skew_ticks = 0; // isolate cap from cross guard
+        let mut m = InventorySkewMaker::new(c);
+        m.on_fill(&fill(Side::Buy, 20));
+        let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
+        m.on_book_update(Timestamp::default(), &book);
+        let gc = m.counters();
+        // Long cap pins the bid; ask posts normally.
+        assert_eq!(gc.suppressed_cap, 1);
+        assert_eq!(gc.quotes_posted, 1);
+        assert_eq!(gc.suppressed_cross, 0);
+        assert_eq!(gc.suppressed_price, 0);
+    }
+
+    #[test]
+    fn cross_guard_bumps_suppressed_cross_counter() {
+        // Re-use the cross-guard fixture: tight base spread + large
+        // short inventory drives the bid above best_ask.
+        let mut c = cfg();
+        c.half_spread_ticks = 1;
+        c.inventory_skew_ticks = 1;
+        let mut m = InventorySkewMaker::new(c);
+        m.on_fill(&fill(Side::Sell, 19));
+        let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
+        m.on_book_update(Timestamp::default(), &book);
+        let gc = m.counters();
+        // Bid would cross → suppressed_cross=1; ask posts normally.
+        assert_eq!(gc.suppressed_cross, 1);
+        assert_eq!(gc.quotes_posted, 1);
+        assert_eq!(gc.suppressed_cap, 0);
+        assert_eq!(gc.suppressed_price, 0);
+    }
+
+    #[test]
+    fn non_positive_price_bumps_suppressed_price_counter() {
+        // Force bid_px <= 0 without crossing (cross is checked first).
+        // Use a low-price book so centre is small; a big negative skew
+        // shift pulls bid below zero while the ask stays safely above
+        // best_bid. With centre=3, half=1, skew_shift = -(-4) = +4 on
+        // inventory=-4: bid = 3-1+4 = 6, ask = 3+1+4 = 8. That's not
+        // what we need — we want bid_px <= 0. Instead: use large long
+        // inventory + low centre so bid sags below zero.
+        // centre=3, half=1, skew=1, inventory=10, skew_shift=10:
+        // bid = 3-1-10 = -8 (<=0 ✓), ask = 3+1-10 = -6 (<=0 too).
+        // We want ask to post normally so the test isolates the price
+        // gate. Trickier: we need one side >0 and the other <=0.
+        // Use large short inventory so skew pushes UP:
+        // centre=3, half=1, inventory=-10, skew_shift=-10:
+        // bid = 3-1+10 = 12, ask = 3+1+10 = 14. Both positive.
+        // Neither arrangement hits price gate on one side only.
+        //
+        // So instead just verify the counter fires when BOTH sides go
+        // non-positive: centre=1, half=5, inventory=0:
+        // bid = 1-5-0 = -4, ask = 1+5-0 = 6. Best_bid=0 so ask(6) > 0
+        // and ask(6) > best_bid(0) → ask posts. bid is non-positive.
+        // But cross guard runs first: bid(-4) >= best_ask(2)? no.
+        // And best_bid must come from the book — book_with expects
+        // a valid bid level. Use lvl(0,...) for bid? Price(0) is legal.
+        //
+        // Simpler construction that hits the price gate on the bid:
+        // bids=[lvl(0, 1)], asks=[lvl(10, 1)]. centre = mid = 5.
+        // half_spread=10 → bid = 5-10 = -5 (<=0), ask = 5+10 = 15.
+        // cross check: bid(-5) >= best_ask(10)? no. ask(15) <= best_bid(0)? no.
+        // → bid hits price gate; ask posts. quote_qty=10, etc.
+        let mut c = cfg();
+        c.half_spread_ticks = 10;
+        c.inventory_skew_ticks = 0;
+        let mut m = InventorySkewMaker::new(c);
+        let book = book_with(vec![lvl(0, 1)], vec![lvl(10, 1)]);
+        m.on_book_update(Timestamp::default(), &book);
+        let gc = m.counters();
+        assert_eq!(gc.suppressed_price, 1);
+        assert_eq!(gc.quotes_posted, 1);
+        assert_eq!(gc.suppressed_cap, 0);
+        assert_eq!(gc.suppressed_cross, 0);
+    }
+
+    #[test]
+    fn counters_accumulate_across_ticks() {
+        let mut m = InventorySkewMaker::new(cfg());
+        let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
+        m.on_book_update(Timestamp::default(), &book);
+        m.on_book_update(Timestamp::default(), &book);
+        m.on_book_update(Timestamp::default(), &book);
+        assert_eq!(m.counters().quotes_posted, 6);
     }
 }
