@@ -1,43 +1,44 @@
 # Cinder build notes
 
 ## Current phase (2026-04-19)
-Live-path PnL metrics — Section 7 P0 #150 (position tracker) +
-Section 8 P0 #164 (real-time MTM) via observability.
+Pre-trade risk wiring — Section 7 P0 "Pre-trade checks".
 
 ## What shipped
-- `ts_pnl::Accountant::position_total()` — signed-position sum across
-  every symbol the accountant has seen.
-- `RunnerMetrics::observe_pnl(realized_net, unrealized, position, mark)`
-  — publishes `ts_position`, `ts_realized_pnl`, `ts_unrealized_pnl`,
-  `ts_total_pnl`, `ts_mark_price`. i128 mantissas saturate to i64 for
-  the gauge. `None` mark suppresses the mark-price series.
-- `LiveRunner::evaluate_pnl_guard` now computes the snapshot once and
-  publishes unconditionally (when metrics are attached), then hands
-  the same values to the guard. Single call site; cadence matches the
-  existing reconcile tick.
-- Stale help text on `ts_kill_switch_reason` fixed: now enumerates
-  codes 0–5 including `max-drawdown` and `daily-loss`.
-- Two new metrics tests: happy-path gauge emission + i128 saturation
-  with mark suppression.
+- `paper_cfg::PreTradeCfg` — `max_position_qty`, `max_order_notional`,
+  `max_open_orders`, `whitelist`. Nested under `risk.pre_trade` so the
+  existing PnL-guard section isn't disturbed. Re-exported via
+  `live_cfg` since it reuses `RiskCfg` verbatim.
+- `ts-paper-run` now calls `build_risk_config(risk.pre_trade)` instead
+  of the hardcoded `RiskConfig::permissive()`. Whitelist entries are
+  normalized to upper-case before hashing into the set so YAML like
+  `btcusdt` matches the traded symbol.
+- Matching CLI flags on `ts-paper-run`: `--max-position-qty`,
+  `--max-order-notional`, `--max-open-orders`, `--whitelist` (comma-
+  separated). They layer on top of YAML like the other flags.
+- `paper_cfg::tests::pre_trade_round_trips` asserts the full nested
+  shape parses from YAML.
 
 ## Design calls
-- Live-path position is a scalar gauge (`ts_position`) summed across
-  symbols. Matches the paper path's shape and is correct for the
-  single-symbol runner today; if multi-symbol ever lands here it
-  becomes semantically fuzzy and we'll want a per-symbol label.
-- Publishing runs inside `evaluate_pnl_guard` to share the mark/
-  realized/unrealized computation with guard evaluation — one round
-  of accountant reads per reconcile tick, not two. Startup seed path
-  (`run()` → `evaluate_pnl_guard()` before the select loop) now also
-  seeds the metrics gauges to zero before the first event, so a
-  scrape during warm-up isn't stale.
-- `observe_live` still only touches counters. The prior comment
-  claiming "live path doesn't maintain its own PnL" is now stale —
-  updated to point at `observe_pnl`.
+- Fields live at `risk.pre_trade.*` rather than flat on `risk.*` so the
+  existing drawdown/daily-loss knobs keep their stable names and
+  operators can grep "pre_trade" to find all pre-submission gates.
+- Each field is `Option<T>`; missing fields inherit the permissive
+  baseline. Lets operators tighten one knob at a time without having
+  to restate the others.
+- Whitelist uppercasing happens at config-build time, not at
+  `RiskEngine::check` time — cheaper (done once) and matches how
+  `ts-paper-run` upper-cases `cfg.market.symbol` everywhere else.
 
 ## Follow-ups
-- Paper-runner (`EngineRunner`) wiring for the PnL guard: same
-  snapshot shape is already available via `ReplaySummary`; deferred.
+- `ts-live-run` accepts the same YAML (via the shared `RiskCfg`) but
+  does **not** wire a `RiskEngine` into the submit path —
+  `BinanceLiveEngine` takes strategy actions directly. Next phase:
+  insert a pre-trade gate in `LiveRunner::handle_market_event` (or
+  inside `BinanceLiveEngine::submit`) that consults a `RiskEngine`
+  seeded from `cfg.risk.pre_trade`. Also add the matching CLI flags
+  to `ts_live_run.rs`.
+- Leverage + cross-venue exposure still unshipped (need perps/margin
+  data and a cross-venue exposure tracker).
 - Per-symbol `ts_position{symbol="..."}` labeled gauges once the
   runner multiplexes more than one instrument.
 - True auto-flatten (submit closing orders on breach) still needs a

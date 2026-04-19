@@ -83,10 +83,11 @@ pub struct MetricsCfg {
     pub listen: String,
 }
 
-/// Optional PnL-guard wiring. A missing section leaves the runner
-/// without a guard; a present section with both limits `None` is a
-/// no-op (guard constructed but nothing to trip on). Mantissas match
-/// [`ts_pnl::Accountant`]: `price_scale * qty_scale`.
+/// Optional risk wiring. Holds both the PnL-guard thresholds (drawdown
+/// / daily-loss) and the pre-trade gate (`pre_trade`). A missing section
+/// leaves the runner with no guard and fully permissive pre-trade
+/// checks. Mantissas match [`ts_pnl::Accountant`] — `price_scale *
+/// qty_scale` for notional, `qty_scale` for position.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RiskCfg {
     /// Drop from peak equity (realized-net + unrealized) that trips
@@ -101,6 +102,28 @@ pub struct RiskCfg {
     /// Defaults to 24 h.
     #[serde(default = "default_day_length_secs")]
     pub day_length_secs: u64,
+    /// Pre-trade gate knobs. `None` == permissive across the board.
+    #[serde(default)]
+    pub pre_trade: Option<PreTradeCfg>,
+}
+
+/// Pre-trade gate thresholds — consumed by `ts_oms::RiskConfig`.
+/// Any field left unset inherits the permissive baseline so operators
+/// can tighten one knob at a time without re-specifying the rest.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PreTradeCfg {
+    /// Per-symbol absolute position cap (mantissa at `qty_scale`).
+    #[serde(default)]
+    pub max_position_qty: Option<i64>,
+    /// Per-order notional cap (mantissa at `price_scale * qty_scale`).
+    #[serde(default)]
+    pub max_order_notional: Option<i64>,
+    /// Global cap on concurrently-open orders.
+    #[serde(default)]
+    pub max_open_orders: Option<usize>,
+    /// Allowed symbols. Omit or leave empty to allow all.
+    #[serde(default)]
+    pub whitelist: Option<Vec<String>>,
 }
 
 fn default_day_length_secs() -> u64 {
@@ -258,6 +281,52 @@ maker:
         assert_eq!(cfg.maker.quote_qty, 3);
         assert_eq!(cfg.maker.cid_prefix, "live");
         assert_eq!(cfg.maker.half_spread_ticks, 5, "base preserved");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pre_trade_round_trips() {
+        let dir = tmpdir("pretrade");
+        write(
+            &dir.join("base.yaml"),
+            r#"
+market:
+  symbol: BTCUSDT
+  price_scale: 2
+  qty_scale: 8
+  ws_url: wss://x
+maker:
+  quote_qty: 1
+  half_spread_ticks: 4
+  inventory_skew_ticks: 0
+  max_inventory: 10
+  cid_prefix: t
+runner:
+  summary_secs: 0
+  channel: 128
+risk:
+  max_drawdown: 5000
+  pre_trade:
+    max_position_qty: 100
+    max_order_notional: 25000
+    max_open_orders: 4
+    whitelist: [BTCUSDT, ETHUSDT]
+"#,
+        );
+        write(&dir.join("dev.yaml"), "{}\n");
+
+        let cfg = PaperCfg::load(&dir, Env::Dev).unwrap();
+        let risk = cfg.risk.as_ref().expect("risk section");
+        assert_eq!(risk.max_drawdown, Some(5000));
+        let pt = risk.pre_trade.as_ref().expect("pre_trade");
+        assert_eq!(pt.max_position_qty, Some(100));
+        assert_eq!(pt.max_order_notional, Some(25000));
+        assert_eq!(pt.max_open_orders, Some(4));
+        assert_eq!(
+            pt.whitelist.as_deref(),
+            Some(&["BTCUSDT".to_string(), "ETHUSDT".to_string()][..])
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

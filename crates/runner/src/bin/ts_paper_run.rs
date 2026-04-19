@@ -36,7 +36,7 @@ use ts_runner::{
     bridge_bus,
     kill_switch_watch::spawn_halt_file_watcher,
     metrics::{spawn_metrics_server, RunnerMetrics},
-    paper_cfg::{AuditCfg, KillSwitchCfg, MetricsCfg, PaperCfg, RiskCfg},
+    paper_cfg::{AuditCfg, KillSwitchCfg, MetricsCfg, PaperCfg, PreTradeCfg, RiskCfg},
     EngineRunner,
 };
 use ts_strategy::{InventorySkewMaker, MakerConfig};
@@ -125,6 +125,24 @@ struct Cli {
     /// trips the kill switch.
     #[arg(long)]
     max_daily_loss: Option<i64>,
+
+    /// Per-symbol absolute position cap (mantissa at `qty_scale`). Any
+    /// submit whose signed fill would exceed this is rejected.
+    #[arg(long)]
+    max_position_qty: Option<i64>,
+
+    /// Per-order notional cap (mantissa at `price_scale * qty_scale`).
+    #[arg(long)]
+    max_order_notional: Option<i64>,
+
+    /// Global cap on concurrently-open orders.
+    #[arg(long)]
+    max_open_orders: Option<usize>,
+
+    /// Symbol whitelist (comma-separated, e.g. `BTCUSDT,ETHUSDT`).
+    /// Any symbol not in the list is rejected before submission.
+    #[arg(long, value_delimiter = ',')]
+    whitelist: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -206,6 +224,28 @@ fn resolve_config(cli: &Cli) -> Result<PaperCfg> {
         }
         cfg.risk = Some(r);
     }
+    if cli.max_position_qty.is_some()
+        || cli.max_order_notional.is_some()
+        || cli.max_open_orders.is_some()
+        || cli.whitelist.is_some()
+    {
+        let mut r = cfg.risk.clone().unwrap_or_default();
+        let mut pt = r.pre_trade.clone().unwrap_or_default();
+        if let Some(v) = cli.max_position_qty {
+            pt.max_position_qty = Some(v);
+        }
+        if let Some(v) = cli.max_order_notional {
+            pt.max_order_notional = Some(v);
+        }
+        if let Some(v) = cli.max_open_orders {
+            pt.max_open_orders = Some(v);
+        }
+        if let Some(v) = cli.whitelist.clone() {
+            pt.whitelist = Some(v);
+        }
+        r.pre_trade = Some(pt);
+        cfg.risk = Some(r);
+    }
 
     Ok(cfg)
 }
@@ -236,7 +276,7 @@ async fn run(cfg: PaperCfg) -> Result<()> {
             symbol: symbol.clone(),
             notional_fallback_price: None,
         },
-        RiskConfig::permissive(),
+        build_risk_config(cfg.risk.as_ref().and_then(|r| r.pre_trade.as_ref())),
         InventorySkewMaker::new(MakerConfig {
             venue: venue.clone(),
             symbol: symbol.clone(),
@@ -353,6 +393,30 @@ async fn run(cfg: PaperCfg) -> Result<()> {
     }
     log_summary(&symbol_str, "final", &summary);
     Ok(())
+}
+
+/// Fold an optional pre-trade config into a [`RiskConfig`]. Missing
+/// fields inherit the permissive baseline, so operators can tighten
+/// one knob at a time. Whitelist entries are normalized to upper-case
+/// so YAML like `btcusdt` matches the symbol the runner trades.
+fn build_risk_config(cfg: Option<&PreTradeCfg>) -> RiskConfig {
+    let mut rc = RiskConfig::permissive();
+    let Some(pt) = cfg else {
+        return rc;
+    };
+    if let Some(v) = pt.max_position_qty {
+        rc.max_position_qty = Qty(v);
+    }
+    if let Some(v) = pt.max_order_notional {
+        rc.max_order_notional = v;
+    }
+    if let Some(v) = pt.max_open_orders {
+        rc.max_open_orders = v;
+    }
+    if let Some(wl) = pt.whitelist.as_ref() {
+        rc.whitelist = wl.iter().map(|s| Symbol::new(s.to_uppercase())).collect();
+    }
+    rc
 }
 
 /// Build a [`PnlGuard`] from `cfg`. Returns `None` when no risk section
