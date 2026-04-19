@@ -22,6 +22,9 @@ pub use decimal::{DecimalError, Price, Qty};
 pub use market::{
     BookDelta, BookLevel, BookSnapshot, Funding, Liquidation, MarketEvent, MarketPayload, Trade,
 };
-pub use order::{ClientOrderId, ExecReport, Fill, NewOrder, OrderKind, OrderStatus, TimeInForce};
+pub use order::{
+    ClientOrderId, ExecReport, Fill, InvalidTransition, NewOrder, OrderKind, OrderStatus,
+    TimeInForce,
+};
 pub use time::Timestamp;
 pub use venue::{InstrumentSpec, Side, Symbol, Venue};
