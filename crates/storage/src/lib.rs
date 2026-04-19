@@ -13,9 +13,11 @@ pub mod clickhouse;
 pub mod config;
 pub mod error;
 pub mod migrate;
+pub mod orders;
 pub mod postgres;
 
 pub use clickhouse::ClickHouse;
 pub use config::{ClickHouseCfg, PostgresCfg};
 pub use error::StorageError;
+pub use orders::{InsertFillReq, InsertOrderReq, OrderRepo};
 pub use postgres::Postgres;

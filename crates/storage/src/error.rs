@@ -32,6 +32,12 @@ pub enum StorageError {
     #[error("migration filename invalid: {0}")]
     BadFilename(String),
 
+    #[error("invalid {field} value: {value}")]
+    InvalidEnum {
+        field: &'static str,
+        value: &'static str,
+    },
+
     #[error("io {path}: {source}")]
     Io {
         path: String,

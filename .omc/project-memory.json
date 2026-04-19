@@ -115,8 +115,8 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 18,
-      "lastAccessed": 1776359272185,
+      "accessCount": 21,
+      "lastAccessed": 1776564068200,
       "type": "file"
     },
     {
@@ -127,8 +127,8 @@
     },
     {
       "path": "crates/core/src/order.rs",
-      "accessCount": 12,
-      "lastAccessed": 1776540076400,
+      "accessCount": 13,
+      "lastAccessed": 1776563943132,
       "type": "file"
     },
     {
@@ -151,8 +151,8 @@
     },
     {
       "path": "crates/core/src/venue.rs",
-      "accessCount": 8,
-      "lastAccessed": 1776359429423,
+      "accessCount": 9,
+      "lastAccessed": 1776564138367,
       "type": "file"
     },
     {
@@ -169,8 +169,8 @@
     },
     {
       "path": "crates/core/src/decimal.rs",
-      "accessCount": 5,
-      "lastAccessed": 1776359305959,
+      "accessCount": 6,
+      "lastAccessed": 1776564012463,
       "type": "file"
     },
     {
@@ -186,6 +186,12 @@
       "type": "file"
     },
     {
+      "path": "crates/storage/src/lib.rs",
+      "accessCount": 5,
+      "lastAccessed": 1776564120271,
+      "type": "file"
+    },
+    {
       "path": "crates/binance/src/decode.rs",
       "accessCount": 4,
       "lastAccessed": 1776372764658,
@@ -198,15 +204,15 @@
       "type": "file"
     },
     {
-      "path": "crates/binance/src/bin/ts_md_binance.rs",
-      "accessCount": 3,
-      "lastAccessed": 1776313569732,
+      "path": "crates/storage/Cargo.toml",
+      "accessCount": 4,
+      "lastAccessed": 1776564124307,
       "type": "file"
     },
     {
-      "path": "crates/storage/src/lib.rs",
+      "path": "crates/binance/src/bin/ts_md_binance.rs",
       "accessCount": 3,
-      "lastAccessed": 1776314051084,
+      "lastAccessed": 1776313569732,
       "type": "file"
     },
     {
@@ -225,6 +231,30 @@
       "path": "crates/binance/src/book.rs",
       "accessCount": 3,
       "lastAccessed": 1776372780731,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/postgres.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776563889956,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/postgres/V002__orders_and_fills.sql",
+      "accessCount": 3,
+      "lastAccessed": 1776563903192,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/postgres/V001__instruments_and_accounts.sql",
+      "accessCount": 3,
+      "lastAccessed": 1776563904107,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/error.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776564145849,
       "type": "file"
     },
     {
@@ -252,30 +282,6 @@
       "type": "file"
     },
     {
-      "path": "infra/migrations/postgres/V002__orders_and_fills.sql",
-      "accessCount": 2,
-      "lastAccessed": 1776312124888,
-      "type": "file"
-    },
-    {
-      "path": "crates/storage/src/postgres.rs",
-      "accessCount": 2,
-      "lastAccessed": 1776312125183,
-      "type": "file"
-    },
-    {
-      "path": "infra/migrations/postgres/V001__instruments_and_accounts.sql",
-      "accessCount": 2,
-      "lastAccessed": 1776312130010,
-      "type": "file"
-    },
-    {
-      "path": "crates/storage/Cargo.toml",
-      "accessCount": 2,
-      "lastAccessed": 1776312130507,
-      "type": "file"
-    },
-    {
       "path": "crates/core/src/bus.rs",
       "accessCount": 2,
       "lastAccessed": 1776312666759,
@@ -288,33 +294,39 @@
       "type": "file"
     },
     {
-      "path": "config/dev.yaml",
-      "accessCount": 1,
-      "lastAccessed": 1776241128664,
-      "type": "file"
-    },
-    {
-      "path": "crates/storage/src/error.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776241468088,
-      "type": "file"
-    },
-    {
-      "path": "crates/storage/src/config.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776241472292,
+      "path": "crates/storage/src/postgres/migrate.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776563896076,
       "type": "file"
     },
     {
       "path": "crates/storage/src/migrate.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776241486335,
+      "accessCount": 2,
+      "lastAccessed": 1776563896576,
       "type": "file"
     },
     {
-      "path": "crates/storage/src/postgres/migrate.rs",
+      "path": "crates/storage/src/config.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776563896839,
+      "type": "file"
+    },
+    {
+      "path": "crates/storage/src/bin/ts_migrate.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776563898374,
+      "type": "file"
+    },
+    {
+      "path": "infra/migrations/postgres/V003__positions_balances_audit.sql",
+      "accessCount": 2,
+      "lastAccessed": 1776563904384,
+      "type": "file"
+    },
+    {
+      "path": "config/dev.yaml",
       "accessCount": 1,
-      "lastAccessed": 1776241517102,
+      "lastAccessed": 1776241128664,
       "type": "file"
     },
     {
@@ -327,18 +339,6 @@
       "path": "crates/storage/src/clickhouse/migrate.rs",
       "accessCount": 1,
       "lastAccessed": 1776241544828,
-      "type": "file"
-    },
-    {
-      "path": "crates/storage/src/bin/ts_migrate.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776241568863,
-      "type": "file"
-    },
-    {
-      "path": "infra/migrations/postgres/V003__positions_balances_audit.sql",
-      "accessCount": 1,
-      "lastAccessed": 1776241602994,
       "type": "file"
     },
     {

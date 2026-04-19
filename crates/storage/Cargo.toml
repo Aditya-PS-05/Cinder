@@ -10,10 +10,12 @@ description = "Postgres + ClickHouse clients and migration tooling for the tradi
 
 [dependencies]
 ts-config = { workspace = true }
+ts-core = { workspace = true }
 
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+chrono = { workspace = true }
 
 tokio = { workspace = true }
 futures = { workspace = true }
