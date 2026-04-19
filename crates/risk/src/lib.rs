@@ -11,8 +11,10 @@
 
 pub mod kill_switch;
 pub mod pnl_guard;
+pub mod staleness_guard;
 pub use kill_switch::{KillSwitch, KillSwitchConfig, TripReason};
 pub use pnl_guard::{GuardBreach, PnlGuard, PnlGuardConfig};
+pub use staleness_guard::{StalenessBreach, StalenessGuard, StalenessGuardConfig};
 
 use std::collections::{HashMap, HashSet};
 

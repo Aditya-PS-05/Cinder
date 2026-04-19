@@ -35,7 +35,7 @@ use ts_core::{
 };
 use ts_oms::OrderEngine;
 use ts_pnl::Accountant;
-use ts_risk::{KillSwitch, PnlGuard, RiskConfig, RiskEngine};
+use ts_risk::{KillSwitch, PnlGuard, RiskConfig, RiskEngine, StalenessGuard};
 use ts_strategy::{Strategy, StrategyAction};
 
 use crate::audit::AuditEvent;
@@ -126,6 +126,12 @@ pub struct LiveRunner<E: OrderEngine> {
     /// correctness is preserved (the runner never reads the log), but
     /// crash recovery is manual.
     intent_log: Option<IntentLogWriter>,
+    /// Detects prolonged silence on the market-data feed. The runner
+    /// stamps the guard on every event and re-evaluates it on every
+    /// reconcile tick; a breach trips the attached [`KillSwitch`] with
+    /// [`ts_risk::TripReason::FeedStaleness`], so we stop quoting
+    /// against a frozen book.
+    staleness_guard: Option<StalenessGuard>,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -175,6 +181,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             risk_config: RiskConfig::permissive(),
             stream_illegal_counter: None,
             intent_log: None,
+            staleness_guard: None,
         }
     }
 
@@ -349,6 +356,12 @@ impl<E: OrderEngine> LiveRunner<E> {
 
     async fn handle_market_event(&mut self, event: MarketEvent) {
         self.summary.events_ingested += 1;
+        // Stamp the staleness guard first — a feed that stays silent
+        // through shutdown is still considered alive for whatever
+        // events *did* arrive before the gap started.
+        if let Some(g) = self.staleness_guard.as_mut() {
+            g.observe_event(Instant::now());
+        }
 
         enum TickKind<'a> {
             Book,
@@ -547,7 +560,34 @@ impl<E: OrderEngine> LiveRunner<E> {
                 m.observe_stream_illegal_transitions(c.load(Ordering::Relaxed));
             }
         }
+        self.evaluate_staleness_guard();
         self.evaluate_pnl_guard();
+    }
+
+    /// Re-evaluate the configured [`StalenessGuard`] and trip the kill
+    /// switch on a breach. A no-op when the guard or kill switch is
+    /// unattached, when the switch is already tripped, or when the
+    /// guard hasn't yet seen a baseline event.
+    fn evaluate_staleness_guard(&mut self) {
+        let Some(guard) = self.staleness_guard.as_mut() else {
+            return;
+        };
+        let Some(ks) = self.kill_switch.as_ref() else {
+            return;
+        };
+        if ks.tripped() {
+            return;
+        }
+        if let Some(breach) = guard.check(Instant::now()) {
+            warn!(
+                ?breach,
+                "live-runner: staleness guard breach; tripping kill switch"
+            );
+            ks.trip(breach.to_trip_reason());
+            if let Some(m) = self.metrics.as_ref() {
+                m.observe_kill_switch(ks);
+            }
+        }
     }
 
     /// Compute the PnL snapshot (realized net, unrealized, position,
@@ -690,6 +730,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     risk_config: RiskConfig,
     stream_illegal_counter: Option<Arc<AtomicU64>>,
     intent_log: Option<IntentLogWriter>,
+    staleness_guard: Option<StalenessGuard>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -773,6 +814,18 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Attach a [`StalenessGuard`] to monitor market-data feed gaps.
+    /// Every market event stamps the guard with the current wall-clock
+    /// time; every reconcile tick re-evaluates it. A breach trips the
+    /// attached [`KillSwitch`] with
+    /// [`ts_risk::TripReason::FeedStaleness`]. The guard is a no-op
+    /// when no kill switch is attached — there is no downstream to
+    /// signal.
+    pub fn staleness_guard(mut self, guard: StalenessGuard) -> Self {
+        self.staleness_guard = Some(guard);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -806,6 +859,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             swept_after_trip: false,
             last_event_ts: Timestamp::default(),
             intent_log: self.intent_log,
+            staleness_guard: self.staleness_guard,
         };
         (runner, handle)
     }
@@ -1811,5 +1865,95 @@ mod tests {
 
         assert_eq!(summary.orders_submitted, 0);
         assert!(summary.orders_rejected >= 2);
+    }
+
+    #[tokio::test]
+    async fn staleness_guard_trips_kill_switch_on_silent_feed() {
+        use ts_risk::{KillSwitch, StalenessGuard, StalenessGuardConfig, TripReason};
+        // Configure a 30 ms max_idle. After a single baseline event
+        // the feed stays silent; several reconcile ticks later, the
+        // gap exceeds 30 ms and the guard trips the kill switch.
+        let api = QueuedApi::new(vec![
+            Ok(ack("bid-1", "NEW")),
+            Ok(ack("ask-1", "NEW")),
+            Ok(ack("bid-2", "CANCELED")),
+            Ok(ack("ask-2", "CANCELED")),
+        ]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = StalenessGuard::new(StalenessGuardConfig {
+            max_idle: Some(Duration::from_millis(30)),
+        });
+
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .staleness_guard(guard)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        // One event seeds the guard's baseline.
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+
+        // Wait long enough for several reconcile ticks past the idle
+        // threshold. 150 ms > 30 ms limit by a healthy margin.
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(ks.tripped(), "silent feed past max_idle must trip");
+        assert_eq!(ks.reason(), Some(TripReason::FeedStaleness));
+    }
+
+    #[tokio::test]
+    async fn staleness_guard_does_not_trip_when_feed_stays_alive() {
+        use ts_risk::{KillSwitch, StalenessGuard, StalenessGuardConfig};
+        // Keep the feed ticking every few ms — well under max_idle.
+        // The guard should never fire.
+        let api = QueuedApi::new(vec![
+            Ok(ack("bid-1", "NEW")),
+            Ok(ack("ask-1", "NEW")),
+            Ok(ack("bid-2", "CANCELED")),
+            Ok(ack("ask-2", "CANCELED")),
+            Ok(ack("bid-3", "NEW")),
+            Ok(ack("ask-3", "NEW")),
+            Ok(ack("bid-4", "CANCELED")),
+            Ok(ack("ask-4", "CANCELED")),
+        ]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 32);
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = StalenessGuard::new(StalenessGuardConfig {
+            max_idle: Some(Duration::from_millis(500)),
+        });
+
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .staleness_guard(guard)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        for seq in 1..5u64 {
+            tx.send(snapshot(10_000 + seq as i64, 10_010 + seq as i64, seq))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(
+            !ks.tripped(),
+            "feed under max_idle must never trip the switch"
+        );
     }
 }

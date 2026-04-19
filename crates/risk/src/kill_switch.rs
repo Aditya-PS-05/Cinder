@@ -38,6 +38,10 @@ pub enum TripReason {
     /// Realized-net loss since the start of the current day exceeded
     /// the configured limit.
     DailyLoss,
+    /// Market-data feed went silent for longer than the configured
+    /// idle threshold. Trading on stale marks is a fast way to pick
+    /// off our own quotes, so we halt until the feed recovers.
+    FeedStaleness,
 }
 
 impl TripReason {
@@ -48,6 +52,7 @@ impl TripReason {
             TripReason::External => 3,
             TripReason::MaxDrawdown => 4,
             TripReason::DailyLoss => 5,
+            TripReason::FeedStaleness => 6,
         }
     }
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -57,6 +62,7 @@ impl TripReason {
             3 => Some(TripReason::External),
             4 => Some(TripReason::MaxDrawdown),
             5 => Some(TripReason::DailyLoss),
+            6 => Some(TripReason::FeedStaleness),
             _ => None,
         }
     }
