@@ -183,6 +183,16 @@ impl<S: Strategy> PaperEngine<S> {
     }
 
     pub(crate) fn submit_internal(&mut self, order: NewOrder, now: Timestamp) -> ExecReport {
+        // Idempotency guard: a cid that's still in the live-orders ledger
+        // is in a non-terminal state (`New` or `PartiallyFilled`). Reject
+        // duplicate submits before they hit risk/exec so the state
+        // machine never has to handle a `New → New` re-entry that
+        // silently replaces an in-flight order.
+        if self.live_orders.contains_key(&order.cid) {
+            let r = ExecReport::rejected(order.cid.clone(), "duplicate cid: order still live");
+            self.strategy.on_exec_report(&r);
+            return r;
+        }
         let ref_price = match self.reference_price(&order) {
             Some(p) => p,
             None => {
@@ -487,6 +497,37 @@ mod tests {
         assert!(report.reason.as_deref().unwrap().contains("notional"));
         assert_eq!(e.risk().open_orders(), 0);
         assert!(e.live_orders().is_empty());
+    }
+
+    #[test]
+    fn duplicate_submit_for_live_cid_is_rejected() {
+        // A buy limit at 90 against asks @ 110 stays New (resting). A
+        // second submit with the same cid must reject without re-running
+        // risk or replacing the live entry.
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), maker());
+        e.apply_event(&snapshot_event(vec![lvl(100, 5)], vec![lvl(110, 5)], 1))
+            .unwrap();
+
+        let limit = NewOrder {
+            cid: ClientOrderId::new("dup"),
+            venue: venue(),
+            symbol: sym(),
+            side: Side::Buy,
+            kind: OrderKind::Limit,
+            tif: TimeInForce::Gtc,
+            qty: Qty(1),
+            price: Some(Price(90)),
+            ts: Timestamp::default(),
+        };
+        let first = e.submit(limit.clone(), Timestamp::default()).unwrap();
+        assert_eq!(first.status, OrderStatus::New);
+        let live_before = e.live_orders().len();
+
+        let second = e.submit(limit, Timestamp::default()).unwrap();
+        assert_eq!(second.status, OrderStatus::Rejected);
+        assert!(second.reason.as_deref().unwrap().contains("duplicate cid"));
+        // The original live entry must still be present and unique.
+        assert_eq!(e.live_orders().len(), live_before);
     }
 
     #[test]

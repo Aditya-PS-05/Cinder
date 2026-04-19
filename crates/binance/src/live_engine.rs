@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use ts_core::{
     ClientOrderId, ExecReport, InstrumentSpec, NewOrder, OrderKind, OrderStatus, Price, Qty, Side,
@@ -112,6 +113,11 @@ pub struct BinanceLiveEngine<A: BinanceOrderApi> {
     /// requires symbol + cid on the wire. Entries are evicted on
     /// terminal status in `reconcile`.
     symbol_by_cid: HashMap<ClientOrderId, Symbol>,
+    /// Cumulative count of [`ExecReport`]s dropped during
+    /// [`Self::reconcile`] because the prev → next transition violated
+    /// [`OrderStatus::can_transition_to`]. Exposed for tests and
+    /// observability — runners surface this as a Prometheus counter.
+    illegal_transitions: u64,
 }
 
 impl<A: BinanceOrderApi> BinanceLiveEngine<A> {
@@ -130,7 +136,15 @@ impl<A: BinanceOrderApi> BinanceLiveEngine<A> {
             rx,
             cache: HashMap::new(),
             symbol_by_cid: HashMap::new(),
+            illegal_transitions: 0,
         }
+    }
+
+    /// Number of [`ExecReport`]s that [`Self::reconcile`] has dropped
+    /// because the cached prev → next transition was illegal under
+    /// [`OrderStatus::can_transition_to`]. Always non-decreasing.
+    pub fn illegal_transitions(&self) -> u64 {
+        self.illegal_transitions
     }
 
     pub fn api(&self) -> &Arc<A> {
@@ -324,13 +338,27 @@ impl<A: BinanceOrderApi> OrderEngine for BinanceLiveEngine<A> {
     fn reconcile(&mut self) -> Result<EngineStep, Self::Error> {
         let mut step = EngineStep::default();
         while let Ok(report) = self.rx.try_recv() {
-            if matches!(
-                report.status,
-                OrderStatus::Filled
-                    | OrderStatus::Canceled
-                    | OrderStatus::Rejected
-                    | OrderStatus::Expired
-            ) {
+            // Validate the prev → next transition against the cached
+            // last-known status. The cache is empty for the first ack on
+            // a cid (any status is a legal entry); for later acks, an
+            // illegal edge usually means a stale REST ack arrived after
+            // a fresher user-stream update — drop it so the cache stays
+            // monotonic with the venue's true lifecycle. Embedded fills
+            // are dropped with the report for the same reason: they
+            // belong to a state we've already moved past.
+            if let Some(prev) = self.cache.get(&report.cid) {
+                if !prev.status.can_transition_to(report.status) {
+                    self.illegal_transitions += 1;
+                    warn!(
+                        cid = %report.cid.as_str(),
+                        from = ?prev.status,
+                        to = ?report.status,
+                        "binance-live-engine: dropping report on illegal status transition"
+                    );
+                    continue;
+                }
+            }
+            if report.status.is_terminal() {
                 self.symbol_by_cid.remove(&report.cid);
             }
             self.cache.insert(report.cid.clone(), report.clone());
@@ -630,6 +658,79 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("expected a rejected report from the HTTP error path");
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_illegal_status_transition_and_counts_it() {
+        // Push two reports onto the inbound channel directly (as the
+        // user-data-stream listener would): a FILLED and then a stale
+        // PARTIALLY_FILLED for the same cid. The second is illegal
+        // (Filled → PartiallyFilled) and must be dropped without
+        // touching the cache or the returned step.
+        let api = Arc::new(QueuedApi::default());
+        let mut eng = BinanceLiveEngine::new(Arc::clone(&api), specs_map(), Venue::BINANCE, 8);
+        let inbound = eng.inbound_sender();
+
+        let filled = ExecReport {
+            cid: ClientOrderId::new("c-stale"),
+            status: OrderStatus::Filled,
+            filled_qty: Qty(1_000),
+            avg_price: Some(Price(6_500_000)),
+            reason: None,
+            fills: Vec::new(),
+        };
+        let stale_partial = ExecReport {
+            cid: ClientOrderId::new("c-stale"),
+            status: OrderStatus::PartiallyFilled,
+            filled_qty: Qty(500),
+            avg_price: Some(Price(6_500_000)),
+            reason: None,
+            fills: Vec::new(),
+        };
+        inbound.send(filled).await.unwrap();
+        inbound.send(stale_partial).await.unwrap();
+
+        // Yield so the channel is observable from try_recv.
+        tokio::task::yield_now().await;
+
+        let step = eng.reconcile().unwrap();
+        assert_eq!(step.reports.len(), 1, "only the FILLED should pass");
+        assert_eq!(step.reports[0].status, OrderStatus::Filled);
+        assert_eq!(eng.illegal_transitions(), 1);
+        // Cache must reflect the legal terminal state, not the stale partial.
+        let cached = eng.query(&ClientOrderId::new("c-stale")).unwrap();
+        assert_eq!(cached.status, OrderStatus::Filled);
+    }
+
+    #[tokio::test]
+    async fn reconcile_accepts_normal_progression_new_partial_filled() {
+        let api = Arc::new(QueuedApi::default());
+        let mut eng = BinanceLiveEngine::new(Arc::clone(&api), specs_map(), Venue::BINANCE, 8);
+        let inbound = eng.inbound_sender();
+
+        for (status, qty) in [
+            (OrderStatus::New, 0),
+            (OrderStatus::PartiallyFilled, 500),
+            (OrderStatus::Filled, 1_000),
+        ] {
+            inbound
+                .send(ExecReport {
+                    cid: ClientOrderId::new("c-prog"),
+                    status,
+                    filled_qty: Qty(qty),
+                    avg_price: None,
+                    reason: None,
+                    fills: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+
+        let step = eng.reconcile().unwrap();
+        assert_eq!(step.reports.len(), 3);
+        assert_eq!(step.reports[2].status, OrderStatus::Filled);
+        assert_eq!(eng.illegal_transitions(), 0);
     }
 
     #[tokio::test]
