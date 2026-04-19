@@ -38,6 +38,11 @@ pub struct MarketCfg {
 pub struct MakerCfg {
     pub quote_qty: i64,
     pub half_spread_ticks: i64,
+    /// Extra half-spread applied proportional to |book imbalance|.
+    /// Zero disables the adverse-selection guard; older YAML configs
+    /// that predate this field still load cleanly via the default.
+    #[serde(default)]
+    pub imbalance_widen_ticks: i64,
     pub inventory_skew_ticks: i64,
     pub max_inventory: i64,
     pub cid_prefix: String,
@@ -76,6 +81,7 @@ impl Default for MakerCfg {
         Self {
             quote_qty: 2,
             half_spread_ticks: 5,
+            imbalance_widen_ticks: 0,
             inventory_skew_ticks: 1,
             max_inventory: 20,
             cid_prefix: "pr".into(),

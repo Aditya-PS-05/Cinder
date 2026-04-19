@@ -210,6 +210,7 @@ async fn run(cfg: PaperCfg) -> Result<()> {
             symbol: symbol.clone(),
             quote_qty: Qty(cfg.maker.quote_qty),
             half_spread_ticks: cfg.maker.half_spread_ticks,
+            imbalance_widen_ticks: cfg.maker.imbalance_widen_ticks,
             inventory_skew_ticks: cfg.maker.inventory_skew_ticks,
             max_inventory: cfg.maker.max_inventory,
             cid_prefix: cfg.maker.cid_prefix.clone(),

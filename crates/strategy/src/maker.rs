@@ -26,6 +26,12 @@ pub struct MakerConfig {
     pub quote_qty: Qty,
     /// Half-spread added to/subtracted from mid, in price-scale ticks.
     pub half_spread_ticks: i64,
+    /// Extra half-spread applied proportional to |imbalance|, in price-
+    /// scale ticks. Zero preserves legacy fixed-spread behaviour. When
+    /// positive, the half-spread widens by up to this many ticks as the
+    /// top-of-book queue imbalance approaches ±1 — an adverse-selection
+    /// guard that demands more edge when directional flow is likely.
+    pub imbalance_widen_ticks: i64,
     /// Per-unit-inventory shift applied to both quotes, in price-scale
     /// ticks. Positive inventory pushes both quotes down (offering more
     /// aggressively, bidding less aggressively) to work back toward flat.
@@ -107,16 +113,24 @@ impl Strategy for InventorySkewMaker {
             None => return Vec::new(),
         };
 
+        // Imbalance widens the spread symmetrically: toxic directional
+        // flow is equally dangerous on both sides because the thin side
+        // gets picked off while the heavy side trades against the move.
+        // floor() keeps widening conservative — no half-tick rounding up.
+        let widen = if self.cfg.imbalance_widen_ticks > 0 {
+            let imb = book.imbalance().unwrap_or(0.0).abs();
+            (self.cfg.imbalance_widen_ticks as f64 * imb).floor() as i64
+        } else {
+            0
+        };
+        let half = self.cfg.half_spread_ticks.saturating_add(widen);
+
         // Inventory skew shifts both quotes by the same amount, so the
         // spread is preserved but the center of mass walks away from the
         // side the maker is long on.
         let skew_shift = self.cfg.inventory_skew_ticks.saturating_mul(self.inventory);
-        let bid_px = centre
-            .saturating_sub(self.cfg.half_spread_ticks)
-            .saturating_sub(skew_shift);
-        let ask_px = centre
-            .saturating_add(self.cfg.half_spread_ticks)
-            .saturating_sub(skew_shift);
+        let bid_px = centre.saturating_sub(half).saturating_sub(skew_shift);
+        let ask_px = centre.saturating_add(half).saturating_sub(skew_shift);
 
         let mut actions = Vec::new();
 
@@ -194,6 +208,7 @@ mod tests {
             symbol: Symbol::from_static("BTCUSDT"),
             quote_qty: Qty(10),
             half_spread_ticks: 5,
+            imbalance_widen_ticks: 0,
             inventory_skew_ticks: 1,
             max_inventory: 20,
             cid_prefix: "mk".into(),
@@ -250,6 +265,49 @@ mod tests {
         assert_eq!(ask.price, Some(Price(110))); // 105 + 5
         assert!(m.open_bid().is_some());
         assert!(m.open_ask().is_some());
+    }
+
+    #[test]
+    fn imbalance_widen_zero_leaves_spread_untouched() {
+        // Default test cfg has imbalance_widen_ticks = 0, so even on a
+        // heavily imbalanced book the half-spread stays at 5 ticks.
+        let mut m = InventorySkewMaker::new(cfg());
+        let book = book_with(vec![lvl(100, 30)], vec![lvl(110, 10)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        let bid = place_order(&actions[0]);
+        let ask = place_order(&actions[1]);
+        // microprice = 107; no widening. bid=102, ask=112.
+        assert_eq!(bid.price, Some(Price(102)));
+        assert_eq!(ask.price, Some(Price(112)));
+    }
+
+    #[test]
+    fn imbalance_widens_spread_when_configured() {
+        let mut c = cfg();
+        c.imbalance_widen_ticks = 10;
+        let mut m = InventorySkewMaker::new(c);
+        // bids=30, asks=10 → |imbalance| = 0.5. widen = floor(10*0.5) = 5.
+        // microprice = 107, effective half = 5 + 5 = 10.
+        let book = book_with(vec![lvl(100, 30)], vec![lvl(110, 10)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        let bid = place_order(&actions[0]);
+        let ask = place_order(&actions[1]);
+        assert_eq!(bid.price, Some(Price(97))); // 107 - 10
+        assert_eq!(ask.price, Some(Price(117))); // 107 + 10
+    }
+
+    #[test]
+    fn imbalance_widen_balanced_book_does_nothing() {
+        let mut c = cfg();
+        c.imbalance_widen_ticks = 10;
+        let mut m = InventorySkewMaker::new(c);
+        // Symmetric queues: imbalance = 0, widen floor(10*0) = 0.
+        let book = book_with(vec![lvl(100, 10)], vec![lvl(110, 10)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        let bid = place_order(&actions[0]);
+        let ask = place_order(&actions[1]);
+        assert_eq!(bid.price, Some(Price(100)));
+        assert_eq!(ask.price, Some(Price(110)));
     }
 
     #[test]

@@ -63,6 +63,8 @@ enum Cmd {
         quote_qty: i64,
         #[arg(long, default_value_t = 5)]
         half_spread_ticks: i64,
+        #[arg(long, default_value_t = 0)]
+        imbalance_widen_ticks: i64,
         #[arg(long, default_value_t = 1)]
         inventory_skew_ticks: i64,
         #[arg(long, default_value_t = 20)]
@@ -101,6 +103,7 @@ async fn main() -> Result<()> {
             symbol,
             quote_qty,
             half_spread_ticks,
+            imbalance_widen_ticks,
             inventory_skew_ticks,
             max_inventory,
             cid_prefix,
@@ -112,6 +115,7 @@ async fn main() -> Result<()> {
                 symbol,
                 quote_qty,
                 half_spread_ticks,
+                imbalance_widen_ticks,
                 inventory_skew_ticks,
                 max_inventory,
                 cid_prefix,
@@ -201,6 +205,7 @@ async fn run_replay(
     symbol: String,
     quote_qty: i64,
     half_spread_ticks: i64,
+    imbalance_widen_ticks: i64,
     inventory_skew_ticks: i64,
     max_inventory: i64,
     cid_prefix: String,
@@ -223,6 +228,7 @@ async fn run_replay(
             symbol: sym.clone(),
             quote_qty: Qty(quote_qty),
             half_spread_ticks,
+            imbalance_widen_ticks,
             inventory_skew_ticks,
             max_inventory,
             cid_prefix,

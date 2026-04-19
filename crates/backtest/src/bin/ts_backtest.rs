@@ -29,6 +29,10 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     half_spread_ticks: i64,
 
+    /// Extra half-spread ticks per unit of |imbalance| (adverse-selection guard).
+    #[arg(long, default_value_t = 0)]
+    imbalance_widen_ticks: i64,
+
     /// Inventory skew in ticks per unit of inventory.
     #[arg(long, default_value_t = 1)]
     inventory_skew_ticks: i64,
@@ -51,6 +55,7 @@ fn main() -> Result<()> {
     let tuning = MakerTuning {
         quote_qty: ts_core::Qty(cli.quote_qty),
         half_spread_ticks: cli.half_spread_ticks,
+        imbalance_widen_ticks: cli.imbalance_widen_ticks,
         inventory_skew_ticks: cli.inventory_skew_ticks,
         max_inventory: cli.max_inventory,
     };

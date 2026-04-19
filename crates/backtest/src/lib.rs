@@ -46,6 +46,7 @@ pub struct Scenario {
 pub struct MakerTuning {
     pub quote_qty: Qty,
     pub half_spread_ticks: i64,
+    pub imbalance_widen_ticks: i64,
     pub inventory_skew_ticks: i64,
     pub max_inventory: i64,
 }
@@ -55,6 +56,7 @@ impl Default for MakerTuning {
         Self {
             quote_qty: Qty(2),
             half_spread_ticks: 5,
+            imbalance_widen_ticks: 0,
             inventory_skew_ticks: 1,
             max_inventory: 20,
         }
@@ -79,6 +81,7 @@ pub fn run_scenario(scenario: &Scenario, tuning: &MakerTuning) -> ReplaySummary 
         symbol: scenario.symbol.clone(),
         quote_qty: tuning.quote_qty,
         half_spread_ticks: tuning.half_spread_ticks,
+        imbalance_widen_ticks: tuning.imbalance_widen_ticks,
         inventory_skew_ticks: tuning.inventory_skew_ticks,
         max_inventory: tuning.max_inventory,
         cid_prefix: "bt".into(),

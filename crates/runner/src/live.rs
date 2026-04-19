@@ -461,6 +461,7 @@ mod tests {
             symbol: sym(),
             quote_qty: Qty(100_000),
             half_spread_ticks: 5,
+            imbalance_widen_ticks: 0,
             inventory_skew_ticks: 0,
             max_inventory: 10_000_000,
             cid_prefix: "live-t".into(),
