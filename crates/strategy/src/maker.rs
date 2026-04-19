@@ -183,13 +183,26 @@ impl Strategy for InventorySkewMaker {
         let at_long_cap = self.inventory >= self.cfg.max_inventory;
         let at_short_cap = self.inventory <= -self.cfg.max_inventory;
 
-        if !at_long_cap && bid_px > 0 {
+        // Passive-only cross guard. A limit posted at or past the
+        // opposite side of the book would be an immediate taker fill
+        // at the venue, not a resting maker quote — which defeats the
+        // whole strategy and pays the taker fee. When the stacked
+        // widening plus skew math pushes a computed price across the
+        // spread, drop that side rather than post it. centre was
+        // derived from a two-sided book, so best_bid and best_ask are
+        // guaranteed Some here.
+        let best_bid_px = book.best_bid().expect("two-sided book").price.0;
+        let best_ask_px = book.best_ask().expect("two-sided book").price.0;
+        let bid_would_cross = bid_px >= best_ask_px;
+        let ask_would_cross = ask_px <= best_bid_px;
+
+        if !at_long_cap && bid_px > 0 && !bid_would_cross {
             let (cid, order) = self.build_order(Side::Buy, Price(bid_px), "b", now);
             self.open_bid = Some(cid);
             actions.push(StrategyAction::Place(order));
         }
 
-        if !at_short_cap && ask_px > 0 {
+        if !at_short_cap && ask_px > 0 && !ask_would_cross {
             let (cid, order) = self.build_order(Side::Sell, Price(ask_px), "a", now);
             self.open_ask = Some(cid);
             actions.push(StrategyAction::Place(order));
@@ -555,8 +568,130 @@ mod tests {
     }
 
     #[test]
-    fn max_long_inventory_suppresses_bid() {
+    fn bid_that_would_cross_best_ask_is_suppressed() {
+        // Contrive a config where the base spread is tiny, then rack
+        // up a hugely negative inventory so the skew pushes both
+        // quotes UP. With inventory=-19 and skew_ticks=1, shift=-19
+        // so bid = centre + 19 - half. On a tight book that lands
+        // the bid above best_ask — the guard must drop it.
+        let mut c = cfg();
+        c.half_spread_ticks = 1;
+        c.inventory_skew_ticks = 1;
+        // max_inventory at 20 keeps us below the suppression cap so
+        // the short cap isn't what's killing the bid in this test.
+        let mut m = InventorySkewMaker::new(c);
+        m.on_fill(&fill(Side::Sell, 19)); // inventory = -19
+        assert_eq!(m.inventory(), -19);
+
+        // mid = 105, half = 1, skew_shift = -19. bid_px = 105-1+19=123,
+        // ask_px = 105+1+19=125. best_ask = 110 → bid(123) >= 110, cross.
+        let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        let places: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                StrategyAction::Place(o) => Some(o),
+                _ => None,
+            })
+            .collect();
+        // Only the ask should survive; the bid would have crossed.
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].side, Side::Sell);
+        assert!(m.open_bid().is_none());
+        assert!(m.open_ask().is_some());
+    }
+
+    #[test]
+    fn ask_that_would_cross_best_bid_is_suppressed() {
+        // Mirror of the above: large long inventory pushes both
+        // quotes down, and a tight base spread lands the ask below
+        // best_bid. Skew must be strong enough to cross the book.
+        let mut c = cfg();
+        c.half_spread_ticks = 1;
+        c.inventory_skew_ticks = 1;
+        let mut m = InventorySkewMaker::new(c);
+        m.on_fill(&fill(Side::Buy, 19)); // inventory = +19
+        assert_eq!(m.inventory(), 19);
+
+        // mid=105, half=1, skew_shift=19. bid_px=105-1-19=85,
+        // ask_px=105+1-19=87. best_bid=100 → ask(87) <= 100, cross.
+        let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        let places: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                StrategyAction::Place(o) => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].side, Side::Buy);
+        assert!(m.open_bid().is_some());
+        assert!(m.open_ask().is_none());
+    }
+
+    #[test]
+    fn cross_guard_triggers_at_the_touch_not_past_it() {
+        // Equality boundary: a bid price that exactly matches best_ask
+        // would execute as a taker on most venues (price-time match),
+        // so the guard must reject equality as well as strict crosses.
+        // Setup: half=5, no skew, symmetric queues so microprice==mid==105.
+        // best_ask=110. To force bid_px=110 we need 105-5+skew=110 → skew=-10.
+        // Use inventory=-10 with skew_ticks=1 to get skew_shift=-10.
+        let mut c = cfg();
+        c.half_spread_ticks = 5;
+        c.inventory_skew_ticks = 1;
+        let mut m = InventorySkewMaker::new(c);
+        m.on_fill(&fill(Side::Sell, 10)); // inventory = -10
+        let book = book_with(vec![lvl(100, 5)], vec![lvl(110, 5)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        // bid_px = 105 - 5 - (-10) = 110; ask_px = 105 + 5 - (-10) = 120.
+        // bid_px == best_ask → crossed by the guard's >= check.
+        let places: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                StrategyAction::Place(o) => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].side, Side::Sell);
+    }
+
+    #[test]
+    fn cross_guard_allows_quotes_exactly_one_tick_inside_the_touch() {
+        // A bid one tick below best_ask and an ask one tick above
+        // best_bid are valid resting quotes — the guard must let
+        // them through. Construct a wide book where centred passive
+        // quotes would naturally land there.
         let mut m = InventorySkewMaker::new(cfg());
+        // Book has a 10-tick spread; half=5 puts bid=100 and ask=110
+        // (from the default test cfg), which is one tick inside the
+        // best_bid=99 and best_ask=111 respectively.
+        let book = book_with(vec![lvl(99, 5)], vec![lvl(111, 5)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        let places: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                StrategyAction::Place(o) => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places.len(), 2);
+        // bid=100 < best_ask=111; ask=110 > best_bid=99. Both safe.
+        assert_eq!(places[0].price, Some(Price(100)));
+        assert_eq!(places[1].price, Some(Price(110)));
+    }
+
+    #[test]
+    fn max_long_inventory_suppresses_bid() {
+        // Disable the skew so this test isolates the inventory-cap
+        // suppression from the cross-guard — otherwise a large long
+        // inventory also drags the ask below best_bid and the cross
+        // guard suppresses the ask too, conflating two behaviours.
+        let mut c = cfg();
+        c.inventory_skew_ticks = 0;
+        let mut m = InventorySkewMaker::new(c);
         m.on_fill(&fill(Side::Buy, 20));
         let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
         let actions = m.on_book_update(Timestamp::default(), &book);
@@ -576,7 +711,11 @@ mod tests {
 
     #[test]
     fn max_short_inventory_suppresses_ask() {
-        let mut m = InventorySkewMaker::new(cfg());
+        // Same rationale as max_long_inventory_suppresses_bid: isolate
+        // the cap from the cross-guard by zeroing the skew.
+        let mut c = cfg();
+        c.inventory_skew_ticks = 0;
+        let mut m = InventorySkewMaker::new(c);
         m.on_fill(&fill(Side::Sell, 20));
         let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
         let actions = m.on_book_update(Timestamp::default(), &book);
