@@ -115,8 +115,8 @@
   "hotPaths": [
     {
       "path": "Cargo.toml",
-      "accessCount": 21,
-      "lastAccessed": 1776564068200,
+      "accessCount": 22,
+      "lastAccessed": 1776564259449,
       "type": "file"
     },
     {
@@ -258,6 +258,12 @@
       "type": "file"
     },
     {
+      "path": "infra/compose/docker-compose.yml",
+      "accessCount": 3,
+      "lastAccessed": 1776564259104,
+      "type": "file"
+    },
+    {
       "path": "config/base.yaml",
       "accessCount": 2,
       "lastAccessed": 1776241639867,
@@ -285,12 +291,6 @@
       "path": "crates/core/src/bus.rs",
       "accessCount": 2,
       "lastAccessed": 1776312666759,
-      "type": "file"
-    },
-    {
-      "path": "infra/compose/docker-compose.yml",
-      "accessCount": 2,
-      "lastAccessed": 1776339096999,
       "type": "file"
     },
     {

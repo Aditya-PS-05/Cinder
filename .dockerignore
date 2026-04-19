@@ -1,0 +1,22 @@
+# Mirror .gitignore plus a few build-time-only paths. Everything we
+# want in the image must be tracked by git anyway, so this keeps the
+# build context small and deterministic.
+target/
+.git/
+.github/
+.omc/
+.claude/
+tmp/
+data/
+*.log
+*.swp
+.DS_Store
+
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.vault/
