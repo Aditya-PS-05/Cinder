@@ -53,6 +53,7 @@ ts-pnl = { path = "crates/pnl" }
 ts-replay = { path = "crates/replay" }
 ts-backtest = { path = "crates/backtest" }
 ts-runner = { path = "crates/runner" }
+ts-report = { path = "crates/report" }
 
 [profile.release]
 lto = "thin"

@@ -26,6 +26,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+ts-report = { workspace = true }
 
 [[bin]]
 name = "ts-paper-run"
