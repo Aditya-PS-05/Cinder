@@ -32,7 +32,7 @@ use ts_core::{bus::Bus, InstrumentSpec, MarketEvent, Qty, Symbol, Venue};
 use ts_risk::{KillSwitch, KillSwitchConfig, PnlGuard, PnlGuardConfig};
 use ts_runner::{
     audit::{spawn_audit_writer, AuditWriter},
-    bridge_bus,
+    bridge_bus, build_risk_config,
     kill_switch_watch::spawn_halt_file_watcher,
     live::{LiveRunner, LiveSummary},
     live_cfg::{KillSwitchCfg, LiveCfg, RiskCfg},
@@ -114,6 +114,25 @@ struct Cli {
     /// trips the kill switch.
     #[arg(long)]
     max_daily_loss: Option<i64>,
+
+    /// Per-symbol absolute position cap (mantissa at `qty_scale`). Any
+    /// submit whose signed fill would exceed this is rejected before it
+    /// reaches the venue.
+    #[arg(long)]
+    max_position_qty: Option<i64>,
+
+    /// Per-order notional cap (mantissa at `price_scale * qty_scale`).
+    #[arg(long)]
+    max_order_notional: Option<i64>,
+
+    /// Global cap on concurrently-open orders.
+    #[arg(long)]
+    max_open_orders: Option<usize>,
+
+    /// Symbol whitelist (comma-separated, e.g. `BTCUSDT,ETHUSDT`).
+    /// Any symbol not in the list is rejected before submission.
+    #[arg(long, value_delimiter = ',')]
+    whitelist: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -203,6 +222,28 @@ fn resolve_config(cli: &Cli) -> Result<LiveCfg> {
         }
         cfg.risk = Some(r);
     }
+    if cli.max_position_qty.is_some()
+        || cli.max_order_notional.is_some()
+        || cli.max_open_orders.is_some()
+        || cli.whitelist.is_some()
+    {
+        let mut r = cfg.risk.clone().unwrap_or_default();
+        let mut pt = r.pre_trade.clone().unwrap_or_default();
+        if let Some(v) = cli.max_position_qty {
+            pt.max_position_qty = Some(v);
+        }
+        if let Some(v) = cli.max_order_notional {
+            pt.max_order_notional = Some(v);
+        }
+        if let Some(v) = cli.max_open_orders {
+            pt.max_open_orders = Some(v);
+        }
+        if let Some(v) = cli.whitelist.clone() {
+            pt.whitelist = Some(v);
+        }
+        r.pre_trade = Some(pt);
+        cfg.risk = Some(r);
+    }
 
     Ok(cfg)
 }
@@ -272,7 +313,10 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     let bridge = bridge_bus(sub, tx);
 
     let mut builder = LiveRunner::builder(engine, strategy, rx)
-        .reconcile_interval(Duration::from_millis(cfg.binance.reconcile_ms));
+        .reconcile_interval(Duration::from_millis(cfg.binance.reconcile_ms))
+        .risk_config(build_risk_config(
+            cfg.risk.as_ref().and_then(|r| r.pre_trade.as_ref()),
+        ));
 
     let summary_interval = Duration::from_secs(cfg.runner.summary_secs);
     if !summary_interval.is_zero() {

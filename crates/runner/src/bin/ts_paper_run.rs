@@ -28,15 +28,15 @@ use tracing_subscriber::EnvFilter;
 use ts_binance::{SpotStreamClient, SpotStreamConfig};
 use ts_config::Env;
 use ts_core::{bus::Bus, InstrumentSpec, MarketEvent, Qty, Symbol, Venue};
-use ts_oms::{EngineConfig, PaperEngine, RiskConfig};
+use ts_oms::{EngineConfig, PaperEngine};
 use ts_replay::{Replay, ReplaySummary};
 use ts_risk::{KillSwitch, KillSwitchConfig, PnlGuard, PnlGuardConfig};
 use ts_runner::{
     audit::{spawn_audit_writer, AuditWriter},
-    bridge_bus,
+    bridge_bus, build_risk_config,
     kill_switch_watch::spawn_halt_file_watcher,
     metrics::{spawn_metrics_server, RunnerMetrics},
-    paper_cfg::{AuditCfg, KillSwitchCfg, MetricsCfg, PaperCfg, PreTradeCfg, RiskCfg},
+    paper_cfg::{AuditCfg, KillSwitchCfg, MetricsCfg, PaperCfg, RiskCfg},
     EngineRunner,
 };
 use ts_strategy::{InventorySkewMaker, MakerConfig};
@@ -393,30 +393,6 @@ async fn run(cfg: PaperCfg) -> Result<()> {
     }
     log_summary(&symbol_str, "final", &summary);
     Ok(())
-}
-
-/// Fold an optional pre-trade config into a [`RiskConfig`]. Missing
-/// fields inherit the permissive baseline, so operators can tighten
-/// one knob at a time. Whitelist entries are normalized to upper-case
-/// so YAML like `btcusdt` matches the symbol the runner trades.
-fn build_risk_config(cfg: Option<&PreTradeCfg>) -> RiskConfig {
-    let mut rc = RiskConfig::permissive();
-    let Some(pt) = cfg else {
-        return rc;
-    };
-    if let Some(v) = pt.max_position_qty {
-        rc.max_position_qty = Qty(v);
-    }
-    if let Some(v) = pt.max_order_notional {
-        rc.max_order_notional = v;
-    }
-    if let Some(v) = pt.max_open_orders {
-        rc.max_open_orders = v;
-    }
-    if let Some(wl) = pt.whitelist.as_ref() {
-        rc.whitelist = wl.iter().map(|s| Symbol::new(s.to_uppercase())).collect();
-    }
-    rc
 }
 
 /// Build a [`PnlGuard`] from `cfg`. Returns `None` when no risk section

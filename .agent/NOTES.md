@@ -1,42 +1,66 @@
 # Cinder build notes
 
 ## Current phase (2026-04-19)
-Pre-trade risk wiring — Section 7 P0 "Pre-trade checks".
+Pre-trade risk wiring for the LIVE runner — finishes the task
+started last phase (Section 7 P0 "Pre-trade checks"), so the
+gate sits in front of `BinanceLiveEngine::submit` as well as
+`PaperEngine`.
 
-## What shipped
-- `paper_cfg::PreTradeCfg` — `max_position_qty`, `max_order_notional`,
-  `max_open_orders`, `whitelist`. Nested under `risk.pre_trade` so the
-  existing PnL-guard section isn't disturbed. Re-exported via
-  `live_cfg` since it reuses `RiskCfg` verbatim.
-- `ts-paper-run` now calls `build_risk_config(risk.pre_trade)` instead
-  of the hardcoded `RiskConfig::permissive()`. Whitelist entries are
-  normalized to upper-case before hashing into the set so YAML like
-  `btcusdt` matches the traded symbol.
-- Matching CLI flags on `ts-paper-run`: `--max-position-qty`,
-  `--max-order-notional`, `--max-open-orders`, `--whitelist` (comma-
-  separated). They layer on top of YAML like the other flags.
-- `paper_cfg::tests::pre_trade_round_trips` asserts the full nested
-  shape parses from YAML.
+## What shipped this phase
+- `LiveRunner` owns a `RiskEngine` (default `RiskConfig::permissive()`)
+  plus a `HashSet<ClientOrderId>` of cids it has reserved a slot for.
+  New builder method `risk_config(RiskConfig)` seeds it.
+- New helper `LiveRunner::submit_with_risk` runs the gate before every
+  strategy-emitted `Place` (both hot path and shutdown sweep):
+  - Computes ref-price from the local book (Limit → `order.price`,
+    Market → opposite side, no fallback) — mirrors
+    `PaperEngine::reference_price`.
+  - Risk rejection → synthesized `ExecReport::rejected` routed through
+    `observe_report`, so the audit tap, strategy callback, metrics,
+    and kill-switch reject-rate all see it. `engine.submit` never
+    fires, so no transport cost and no venue rejection.
+  - Risk pass → `record_submit` + `live_cids.insert` before calling
+    the engine. Transport error rolls back the reservation.
+- `observe_fill` calls `risk.record_fill`; `observe_report` calls
+  `risk.record_complete` when the status is terminal AND the cid is
+  in `live_cids`. Externally-injected cids (arriving via the
+  user-data-stream through `engine.inbound_sender`) never reserved a
+  slot, so they won't spuriously decrement `open_orders`.
+- `ts-live-run` now accepts the same pre-trade surface as
+  `ts-paper-run`: CLI flags `--max-position-qty`, `--max-order-notional`,
+  `--max-open-orders`, `--whitelist` (comma-separated) layered on top
+  of the shared `risk.pre_trade.*` YAML section.
+- Extracted `build_risk_config` from `ts_paper_run.rs` to
+  `ts_runner::lib.rs` so paper and live share one folding helper.
+  Divergence here has historically been a silent source of paper-vs-live
+  drift — single source of truth now.
+- Two new tests in `crates/runner/src/live.rs`:
+  - `pre_trade_whitelist_rejects_orders_before_reaching_venue` — seeds
+    a whitelist that excludes BTCUSDT with an empty `QueuedApi` (whose
+    `pop()` panics on call); the runner drives the maker on a snapshot,
+    both quotes surface as Rejected, `orders_submitted == 0`,
+    `reconcile_errors == 0` proving the transport was never touched.
+  - `pre_trade_notional_cap_blocks_oversized_order` — tightens
+    `max_order_notional` to 1 and asserts the same gate behavior.
 
 ## Design calls
-- Fields live at `risk.pre_trade.*` rather than flat on `risk.*` so the
-  existing drawdown/daily-loss knobs keep their stable names and
-  operators can grep "pre_trade" to find all pre-submission gates.
-- Each field is `Option<T>`; missing fields inherit the permissive
-  baseline. Lets operators tighten one knob at a time without having
-  to restate the others.
-- Whitelist uppercasing happens at config-build time, not at
-  `RiskEngine::check` time — cheaper (done once) and matches how
-  `ts-paper-run` upper-cases `cfg.market.symbol` everywhere else.
+- `live_cids` is a set, not a counter: the `RiskEngine` open-order
+  counter is a single integer, so without a set we'd have no way to
+  tell "cid we tracked" from "cid we never saw". External pushes
+  (user-data-stream) are explicit first-class inputs here and the
+  counter must stay monotonic for them.
+- `orders_submitted` is incremented only AFTER `risk.check` passes,
+  matching the paper runner's replay summary which counts
+  risk-rejected orders as `orders_rejected` (not submitted).
+- `reference_price` has no fallback — the live runner never had a
+  `notional_fallback_price` config and adding one felt like scope
+  creep. The maker only emits Limit orders today, so the Market
+  branch is theoretical.
+- `submit_with_risk` takes a `&str err_ctx` so the existing "submit
+  failed" vs "shutdown submit failed" log strings survive the
+  refactor. Keeps log-grep contracts intact.
 
 ## Follow-ups
-- `ts-live-run` accepts the same YAML (via the shared `RiskCfg`) but
-  does **not** wire a `RiskEngine` into the submit path —
-  `BinanceLiveEngine` takes strategy actions directly. Next phase:
-  insert a pre-trade gate in `LiveRunner::handle_market_event` (or
-  inside `BinanceLiveEngine::submit`) that consults a `RiskEngine`
-  seeded from `cfg.risk.pre_trade`. Also add the matching CLI flags
-  to `ts_live_run.rs`.
 - Leverage + cross-venue exposure still unshipped (need perps/margin
   data and a cross-venue exposure tracker).
 - Per-symbol `ts_position{symbol="..."}` labeled gauges once the
@@ -48,3 +72,7 @@ Pre-trade risk wiring — Section 7 P0 "Pre-trade checks".
   alive until the runner exits and the shutdown sweep runs.
 - Cross-asset commission accounting still open; guard under-counts
   daily loss whenever BNB-discounted fees are material.
+- `RiskEngine::check` takes `&self` but `record_submit` takes
+  `&mut self`. The submit-then-check ordering inside
+  `submit_with_risk` is single-threaded today, but if we ever
+  parallelize quote emission per symbol, expect contention here.

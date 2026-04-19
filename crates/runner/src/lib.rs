@@ -29,13 +29,15 @@ use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::{debug, warn};
 
-use ts_core::{bus::Subscription, MarketEvent, Price, Timestamp};
+use ts_core::{bus::Subscription, MarketEvent, Price, Qty, Symbol, Timestamp};
+use ts_oms::RiskConfig;
 use ts_replay::{Replay, ReplaySummary};
 use ts_risk::{KillSwitch, PnlGuard};
 use ts_strategy::Strategy;
 
 use crate::audit::AuditEvent;
 use crate::metrics::RunnerMetrics;
+use crate::paper_cfg::PreTradeCfg;
 
 pub struct EngineRunner<S: Strategy> {
     replay: Replay<S>,
@@ -320,6 +322,34 @@ impl<S: Strategy> EngineRunner<S> {
             }
         }
     }
+}
+
+/// Fold an optional pre-trade config into a [`RiskConfig`]. Missing
+/// fields inherit the permissive baseline, so operators can tighten
+/// one knob at a time. Whitelist entries are normalized to upper-case
+/// so YAML like `btcusdt` matches the symbol the runner trades.
+///
+/// Shared between `ts-paper-run` and `ts-live-run` so the pre-trade
+/// surface stays identical across paper and live; divergence here has
+/// historically been a silent source of paper-vs-live drift.
+pub fn build_risk_config(cfg: Option<&PreTradeCfg>) -> RiskConfig {
+    let mut rc = RiskConfig::permissive();
+    let Some(pt) = cfg else {
+        return rc;
+    };
+    if let Some(v) = pt.max_position_qty {
+        rc.max_position_qty = Qty(v);
+    }
+    if let Some(v) = pt.max_order_notional {
+        rc.max_order_notional = v;
+    }
+    if let Some(v) = pt.max_open_orders {
+        rc.max_open_orders = v;
+    }
+    if let Some(wl) = pt.whitelist.as_ref() {
+        rc.whitelist = wl.iter().map(|s| Symbol::new(s.to_uppercase())).collect();
+    }
+    rc
 }
 
 /// Spawn a blocking task that drains a [`ts_core::bus::Subscription`]

@@ -20,6 +20,7 @@
 //! market events: a timer ticks reconcile even during quiet periods so
 //! fills arrive bounded-latency after the user-data-stream lands them.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,10 +28,13 @@ use tokio::sync::{broadcast, mpsc, Notify};
 use tracing::{debug, error, warn};
 
 use ts_book::OrderBook;
-use ts_core::{ExecReport, Fill, MarketEvent, MarketPayload, Price, Timestamp};
+use ts_core::{
+    ClientOrderId, ExecReport, Fill, MarketEvent, MarketPayload, NewOrder, OrderKind, Price, Side,
+    Timestamp,
+};
 use ts_oms::OrderEngine;
 use ts_pnl::Accountant;
-use ts_risk::{KillSwitch, PnlGuard};
+use ts_risk::{KillSwitch, PnlGuard, RiskConfig, RiskEngine};
 use ts_strategy::{Strategy, StrategyAction};
 
 use crate::audit::AuditEvent;
@@ -72,6 +76,19 @@ pub struct LiveRunner<E: OrderEngine> {
     /// accountant is always constructed; the guard is the opt-in piece.
     accountant: Accountant,
     pnl_guard: Option<PnlGuard>,
+    /// Pre-trade gate. Owned by the runner so risk rejects surface as
+    /// `OrderStatus::Rejected` reports without ever touching the venue.
+    /// Defaults to `RiskConfig::permissive()` when no config is attached,
+    /// matching the hardcoded baseline the paper runner used before the
+    /// pre-trade section landed.
+    risk: RiskEngine,
+    /// Cids that have passed `risk.check` and been recorded via
+    /// `risk.record_submit`. Kept so `risk.record_complete` only fires
+    /// once per order and only for orders this runner is tracking — an
+    /// externally-injected cid arriving via the user-data-stream
+    /// (`engine.inbound_sender()`) wouldn't be in this set and so won't
+    /// decrement the open-order counter.
+    live_cids: HashSet<ClientOrderId>,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -117,6 +134,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             metrics: None,
             kill_switch: None,
             pnl_guard: None,
+            risk_config: RiskConfig::permissive(),
         }
     }
 
@@ -208,14 +226,8 @@ impl<E: OrderEngine> LiveRunner<E> {
                     }
                 },
                 StrategyAction::Place(order) => {
-                    self.summary.orders_submitted += 1;
-                    match self.engine.submit(order, now) {
-                        Ok(report) => self.observe_report(report).await,
-                        Err(err) => {
-                            error!(error = %err, "live-runner: shutdown submit failed");
-                            self.summary.reconcile_errors += 1;
-                        }
-                    }
+                    self.submit_with_risk(order, now, "shutdown submit failed")
+                        .await;
                 }
             }
         }
@@ -256,14 +268,8 @@ impl<E: OrderEngine> LiveRunner<E> {
             }
             match action {
                 StrategyAction::Place(order) => {
-                    self.summary.orders_submitted += 1;
-                    match self.engine.submit(order, event.local_ts) {
-                        Ok(report) => self.observe_report(report).await,
-                        Err(err) => {
-                            error!(error = %err, "live-runner: submit failed");
-                            self.summary.reconcile_errors += 1;
-                        }
-                    }
+                    self.submit_with_risk(order, event.local_ts, "submit failed")
+                        .await;
                 }
                 StrategyAction::Cancel(cid) => match self.engine.cancel(&cid) {
                     Ok(report) => self.observe_report(report).await,
@@ -272,6 +278,63 @@ impl<E: OrderEngine> LiveRunner<E> {
                         self.summary.reconcile_errors += 1;
                     }
                 },
+            }
+        }
+    }
+
+    /// Run the pre-trade gate, submit if it passes, and emit a synthetic
+    /// `Rejected` report when it doesn't. `err_ctx` identifies the call
+    /// site in the transport-error log so the shutdown-sweep path
+    /// doesn't masquerade as the hot path. The reference price mirrors
+    /// [`ts_oms::PaperEngine::reference_price`] sans fallback — limit
+    /// orders use their own price, market orders probe the opposite
+    /// side of the local book, and a missing opposite side is a reject.
+    async fn submit_with_risk(&mut self, order: NewOrder, now: Timestamp, err_ctx: &str) {
+        let ref_price = match self.reference_price(&order) {
+            Some(p) => p,
+            None => {
+                let r = ExecReport::rejected(order.cid.clone(), "no reference price available");
+                self.observe_report(r).await;
+                return;
+            }
+        };
+        if let Err(rej) = self.risk.check(&order, ref_price) {
+            let r = ExecReport::rejected(order.cid.clone(), rej.to_string());
+            self.observe_report(r).await;
+            return;
+        }
+        // Pre-trade passed — reserve the slot before the submit so
+        // back-to-back actions see the updated open-order count.
+        self.risk.record_submit(&order);
+        self.live_cids.insert(order.cid.clone());
+        self.summary.orders_submitted += 1;
+
+        let cid = order.cid.clone();
+        match self.engine.submit(order, now) {
+            Ok(report) => self.observe_report(report).await,
+            Err(err) => {
+                error!(error = %err, "live-runner: {err_ctx}");
+                self.summary.reconcile_errors += 1;
+                // Transport failed; roll back the reservation so the
+                // open-order counter reflects reality. No observe_report
+                // — there was no ack to attribute this to.
+                if self.live_cids.remove(&cid) {
+                    self.risk.record_complete(&cid);
+                }
+            }
+        }
+    }
+
+    fn reference_price(&self, order: &NewOrder) -> Option<Price> {
+        match order.kind {
+            OrderKind::Limit => order.price,
+            OrderKind::Market => {
+                let opposite = match order.side {
+                    Side::Buy => self.book.best_ask(),
+                    Side::Sell => self.book.best_bid(),
+                    Side::Unknown => None,
+                };
+                opposite.map(|lvl| lvl.price)
             }
         }
     }
@@ -370,6 +433,13 @@ impl<E: OrderEngine> LiveRunner<E> {
             OrderStatus::Expired => self.summary.orders_expired += 1,
             OrderStatus::PartiallyFilled => {}
         }
+        // Release the risk-engine's open-order reservation exactly once
+        // per terminal report, and only for cids we submitted through
+        // our pre-trade gate — external cids (user-data-stream pushes)
+        // never reserved a slot, so there is nothing to release.
+        if report.status.is_terminal() && self.live_cids.remove(&report.cid) {
+            self.risk.record_complete(&report.cid);
+        }
         // Fills embedded in a report are re-exposed in `EngineStep::fills`
         // by BinanceLiveEngine::reconcile, so we only forward them from
         // `observe_fill`. Synchronous reports from submit/cancel always
@@ -387,6 +457,7 @@ impl<E: OrderEngine> LiveRunner<E> {
     async fn observe_fill(&mut self, fill: Fill) {
         self.strategy.on_fill(&fill);
         self.accountant.on_fill(&fill);
+        self.risk.record_fill(&fill);
         self.summary.fills += 1;
         if let Some(tx) = self.audit_tx.as_ref() {
             if tx.send(AuditEvent::Fill(fill)).await.is_err() {
@@ -418,6 +489,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     metrics: Option<Arc<RunnerMetrics>>,
     kill_switch: Option<Arc<KillSwitch>>,
     pnl_guard: Option<PnlGuard>,
+    risk_config: RiskConfig,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -461,6 +533,15 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Seed the runner's pre-trade [`RiskEngine`]. Defaults to
+    /// [`RiskConfig::permissive`]; pass a tightened config (position
+    /// cap, notional cap, open-order cap, whitelist) to enforce
+    /// per-order limits before submits hit the venue.
+    pub fn risk_config(mut self, cfg: RiskConfig) -> Self {
+        self.risk_config = cfg;
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -487,6 +568,8 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             summary: LiveSummary::default(),
             accountant: Accountant::new(),
             pnl_guard: self.pnl_guard,
+            risk: RiskEngine::new(self.risk_config),
+            live_cids: HashSet::new(),
         };
         (runner, handle)
     }
@@ -937,5 +1020,80 @@ mod tests {
         let _ = task.await.unwrap();
 
         assert!(!ks.tripped(), "modest loss must stay below the limit");
+    }
+
+    #[tokio::test]
+    async fn pre_trade_whitelist_rejects_orders_before_reaching_venue() {
+        // Tighten the pre-trade gate so the maker's BTCUSDT symbol is
+        // NOT whitelisted. QueuedApi is empty — if the runner tried to
+        // submit, its pop() would panic. Instead the risk engine
+        // short-circuits, each rejected Place surfaces as a Rejected
+        // report via observe_report, and orders_submitted stays at 0.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let mut risk_cfg = RiskConfig::permissive();
+        risk_cfg.whitelist.insert(Symbol::from_static("ETHUSDT"));
+
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .risk_config(risk_cfg)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(
+            summary.orders_submitted, 0,
+            "risk must short-circuit before submit"
+        );
+        assert!(
+            summary.orders_rejected >= 2,
+            "both maker quotes must surface as Rejected, got {}",
+            summary.orders_rejected
+        );
+        // Transport never fired, so there can be no reconcile_errors.
+        assert_eq!(summary.reconcile_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn pre_trade_notional_cap_blocks_oversized_order() {
+        // A per-order notional cap of 1 blocks any meaningful quote.
+        // With an empty QueuedApi, a single submit reaching the engine
+        // would panic — proving the risk gate gatekeeps synchronously.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let mut risk_cfg = RiskConfig::permissive();
+        risk_cfg.max_order_notional = 1;
+
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .risk_config(risk_cfg)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(summary.orders_submitted, 0);
+        assert!(summary.orders_rejected >= 2);
     }
 }
