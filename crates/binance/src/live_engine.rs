@@ -335,6 +335,10 @@ impl<A: BinanceOrderApi> OrderEngine for BinanceLiveEngine<A> {
         self.cache.get(cid).cloned()
     }
 
+    fn illegal_transitions(&self) -> u64 {
+        self.illegal_transitions
+    }
+
     fn reconcile(&mut self) -> Result<EngineStep, Self::Error> {
         let mut step = EngineStep::default();
         while let Ok(report) = self.rx.try_recv() {

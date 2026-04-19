@@ -18,7 +18,8 @@
 //! every reconnect, so the retry logic has to coordinate REST + WS.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -79,11 +80,26 @@ impl UserDataStreamConfig {
 pub struct UserDataStreamClient {
     cfg: UserDataStreamConfig,
     rest: Arc<SignedClient>,
+    guard: TransitionGuard,
 }
 
 impl UserDataStreamClient {
     pub fn new(cfg: UserDataStreamConfig, rest: Arc<SignedClient>) -> Self {
-        Self { cfg, rest }
+        Self {
+            cfg,
+            rest,
+            guard: TransitionGuard::new(),
+        }
+    }
+
+    /// Cumulative count of user-stream [`ExecReport`]s dropped because
+    /// the cached prev → next status transition violated
+    /// [`OrderStatus::can_transition_to`]. Runs ahead of the engine so
+    /// stale frames never reach the reconcile channel; the engine keeps
+    /// a matching counter for the REST ack path, and together they let
+    /// operators see where stale lifecycle frames enter.
+    pub fn illegal_transitions(&self) -> u64 {
+        self.guard.illegal_count()
     }
 
     /// Run one session end-to-end: create a listenKey, open the WS,
@@ -167,6 +183,9 @@ impl UserDataStreamClient {
     ) -> Result<(), BinanceError> {
         match decode_user_stream_frame(body, &self.cfg.specs, &self.cfg.venue)? {
             Some(UserStreamEvent::Report(report)) => {
+                if !self.guard.admit(&report) {
+                    return Ok(());
+                }
                 if report_tx.send(report).await.is_err() {
                     return Err(BinanceError::Unsupported(
                         "report channel closed by consumer".into(),
@@ -176,6 +195,58 @@ impl UserDataStreamClient {
             None => {}
         }
         Ok(())
+    }
+}
+
+/// Prev → next [`OrderStatus`] sanity check for the user-data-stream.
+///
+/// Binance occasionally reorders frames — a stale `PARTIALLY_FILLED`
+/// arriving after `FILLED`, a late `NEW` after a `CANCELED`, etc. The
+/// engine's reconcile loop already guards against illegal edges, but
+/// filtering at the listener means the engine channel stays clean and
+/// the counter here pins blame to the stream rather than the REST path.
+/// Admitted reports update the cache; rejected ones bump
+/// `illegal_count` and are dropped.
+#[derive(Debug, Default)]
+pub(crate) struct TransitionGuard {
+    cache: Mutex<HashMap<ClientOrderId, OrderStatus>>,
+    illegal: AtomicU64,
+}
+
+impl TransitionGuard {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Validate `report.status` against the cached last-known status for
+    /// `report.cid`. Returns `true` when the listener should forward —
+    /// either no prior state is cached (first sighting) or the edge is
+    /// legal. Illegal edges log a warn, bump the counter, and return
+    /// `false` without mutating the cache.
+    pub(crate) fn admit(&self, report: &ExecReport) -> bool {
+        let mut cache = self.cache.lock().expect("transition guard cache poisoned");
+        let prev = cache.get(&report.cid).copied();
+        match prev {
+            Some(p) if !p.can_transition_to(report.status) => {
+                drop(cache);
+                self.illegal.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    cid = %report.cid.as_str(),
+                    from = ?p,
+                    to = ?report.status,
+                    "user-stream: dropping illegal OrderStatus transition"
+                );
+                false
+            }
+            _ => {
+                cache.insert(report.cid.clone(), report.status);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn illegal_count(&self) -> u64 {
+        self.illegal.load(Ordering::Relaxed)
     }
 }
 
@@ -554,5 +625,66 @@ mod tests {
     #[test]
     fn avg_price_helper_is_zero_safe() {
         assert_eq!(avg_price_from_cumulative(Qty(0), Qty(0), 5), None);
+    }
+
+    fn report(cid: &str, status: OrderStatus) -> ExecReport {
+        ExecReport {
+            cid: ClientOrderId::new(cid),
+            status,
+            filled_qty: Qty(0),
+            avg_price: None,
+            reason: None,
+            fills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn transition_guard_admits_first_report_for_any_cid() {
+        let g = TransitionGuard::new();
+        // With no cached prev, any status is legal — including terminal
+        // ones like Filled (in case the first frame we see is post-fill).
+        assert!(g.admit(&report("c1", OrderStatus::New)));
+        assert!(g.admit(&report("c2", OrderStatus::Filled)));
+        assert_eq!(g.illegal_count(), 0);
+    }
+
+    #[test]
+    fn transition_guard_allows_new_partial_filled_progression() {
+        let g = TransitionGuard::new();
+        assert!(g.admit(&report("c1", OrderStatus::New)));
+        assert!(g.admit(&report("c1", OrderStatus::PartiallyFilled)));
+        assert!(g.admit(&report("c1", OrderStatus::Filled)));
+        assert_eq!(g.illegal_count(), 0);
+    }
+
+    #[test]
+    fn transition_guard_drops_stale_partial_after_filled() {
+        let g = TransitionGuard::new();
+        assert!(g.admit(&report("stale", OrderStatus::Filled)));
+        // Classic reorder case: a PARTIALLY_FILLED frame arriving after
+        // the terminal FILLED. Must be dropped and counted.
+        assert!(!g.admit(&report("stale", OrderStatus::PartiallyFilled)));
+        assert_eq!(g.illegal_count(), 1);
+        // A second stale frame increments the counter again; the cache
+        // still reflects the terminal FILLED — not the rejected update.
+        assert!(!g.admit(&report("stale", OrderStatus::PartiallyFilled)));
+        assert_eq!(g.illegal_count(), 2);
+        // A fresh, legal transition (terminal → terminal is not) would
+        // still fail — Filled is absorbing. Verify the cache stayed pinned.
+        assert!(!g.admit(&report("stale", OrderStatus::New)));
+        assert_eq!(g.illegal_count(), 3);
+    }
+
+    #[test]
+    fn transition_guard_isolates_cids() {
+        let g = TransitionGuard::new();
+        // An illegal transition on one cid must not leak into another:
+        // each cid has its own cached prev.
+        assert!(g.admit(&report("a", OrderStatus::Filled)));
+        assert!(!g.admit(&report("a", OrderStatus::New)));
+        // cid "b" is untouched — first sighting for "b" is always legal.
+        assert!(g.admit(&report("b", OrderStatus::New)));
+        assert!(g.admit(&report("b", OrderStatus::Filled)));
+        assert_eq!(g.illegal_count(), 1);
     }
 }

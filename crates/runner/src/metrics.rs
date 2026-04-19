@@ -133,6 +133,13 @@ pub struct RunnerMetrics {
     kill_switch_tripped: AtomicU64,
     kill_switch_reason: AtomicU64,
 
+    /// Cumulative count of [`ts_core::ExecReport`]s the live engine has
+    /// dropped because the prev → next transition violated
+    /// [`ts_core::OrderStatus::can_transition_to`]. Sourced from
+    /// [`ts_oms::OrderEngine::illegal_transitions`] on every reconcile
+    /// tick; non-decreasing.
+    illegal_transitions: AtomicU64,
+
     /// `local_ts - exchange_ts` per observed event. Captures the
     /// WS → decoder → runner leg; ignores events the venue did not
     /// stamp (both timestamps must be set for the sample to count).
@@ -202,6 +209,14 @@ impl RunnerMetrics {
             None => 0,
         };
         self.kill_switch_reason.store(code, Ordering::Relaxed);
+    }
+
+    /// Publish the engine's cumulative illegal-transition count into the
+    /// `ts_illegal_transitions_total` counter. The value is monotone in
+    /// the source — overwriting on each call is safe and keeps the
+    /// publish path lock-free.
+    pub fn observe_illegal_transitions(&self, value: u64) {
+        self.illegal_transitions.store(value, Ordering::Relaxed);
     }
 
     /// Record a single [`MarketEvent`]'s exchange→local latency into the
@@ -438,6 +453,12 @@ impl RunnerMetrics {
             "ts_kill_switch_reason",
             "Trip reason: 0 armed, 1 reject-rate, 2 manual, 3 external, 4 max-drawdown, 5 daily-loss.",
             self.kill_switch_reason.load(Ordering::Relaxed) as i64,
+        );
+        counter(
+            &mut out,
+            "ts_illegal_transitions_total",
+            "ExecReports dropped by the live engine on illegal OrderStatus transitions.",
+            self.illegal_transitions.load(Ordering::Relaxed),
         );
         self.ingest_latency_nanos.encode(
             &mut out,
@@ -812,6 +833,35 @@ mod tests {
         assert!(
             !body.contains("ts_symbol_"),
             "labeled block must be hidden when empty, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn observe_illegal_transitions_emits_counter_with_latest_value() {
+        let m = RunnerMetrics::new();
+        // Counter starts at zero and is published on every observe call.
+        let body0 = m.encode_prometheus();
+        assert!(
+            body0.contains("# TYPE ts_illegal_transitions_total counter"),
+            "counter type line missing, got:\n{body0}"
+        );
+        assert!(
+            body0.contains("ts_illegal_transitions_total 0"),
+            "default value should be 0, got:\n{body0}"
+        );
+        m.observe_illegal_transitions(7);
+        let body1 = m.encode_prometheus();
+        assert!(
+            body1.contains("ts_illegal_transitions_total 7"),
+            "expected updated value, got:\n{body1}"
+        );
+        // Source is monotone — overwriting with a larger value is the
+        // common case and must surface unchanged.
+        m.observe_illegal_transitions(11);
+        let body2 = m.encode_prometheus();
+        assert!(
+            body2.contains("ts_illegal_transitions_total 11"),
+            "expected latest value, got:\n{body2}"
         );
     }
 

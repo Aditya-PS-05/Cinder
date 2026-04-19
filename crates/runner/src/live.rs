@@ -291,6 +291,13 @@ impl<E: OrderEngine> LiveRunner<E> {
                 self.summary.reconcile_errors += 1;
             }
         }
+        // Mirror the engine's cumulative illegal-transition counter
+        // into Prometheus on every tick. Cheap (single atomic load +
+        // store) and the only call site, so the gauge tracks the engine
+        // even on quiet reconcile passes.
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_illegal_transitions(self.engine.illegal_transitions());
+        }
         self.evaluate_pnl_guard();
     }
 
@@ -793,6 +800,74 @@ mod tests {
 
         assert!(ks.tripped(), "kill switch should trip on realized loss");
         assert_eq!(ks.reason(), Some(TripReason::DailyLoss));
+    }
+
+    #[tokio::test]
+    async fn illegal_transition_count_is_mirrored_into_runner_metrics() {
+        // Push two reports for the same cid: a FILLED then a stale
+        // PARTIALLY_FILLED. The engine drops the stale one and bumps its
+        // illegal_transitions counter; the runner must mirror that into
+        // RunnerMetrics on the next reconcile tick so /metrics surfaces
+        // it as ts_illegal_transitions_total.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+        let inbound = engine.inbound_sender();
+
+        let metrics = RunnerMetrics::new();
+        let (_tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .metrics(Arc::clone(&metrics))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        let cid = ClientOrderId::new("c-stale");
+        inbound
+            .send(ExecReport {
+                cid: cid.clone(),
+                status: OrderStatus::Filled,
+                filled_qty: Qty(100_000),
+                avg_price: Some(Price(10_000)),
+                reason: None,
+                fills: vec![],
+            })
+            .await
+            .unwrap();
+        inbound
+            .send(ExecReport {
+                cid: cid.clone(),
+                status: OrderStatus::PartiallyFilled,
+                filled_qty: Qty(50_000),
+                avg_price: Some(Price(10_000)),
+                reason: None,
+                fills: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Wait for at least one reconcile tick to drain both reports
+        // and publish the engine's illegal_transitions count.
+        let mut saw_one = false;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if metrics
+                .encode_prometheus()
+                .contains("ts_illegal_transitions_total 1")
+            {
+                saw_one = true;
+                break;
+            }
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(
+            saw_one,
+            "expected ts_illegal_transitions_total 1 in metrics, got:\n{}",
+            metrics.encode_prometheus()
+        );
     }
 
     #[tokio::test]

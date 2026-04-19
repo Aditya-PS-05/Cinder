@@ -58,6 +58,16 @@ pub trait OrderEngine {
     /// call. Paper engines return an empty step because they have no
     /// out-of-band updates.
     fn reconcile(&mut self) -> Result<EngineStep, Self::Error>;
+
+    /// Cumulative count of [`ExecReport`]s the engine has dropped
+    /// because the prev → next transition violated the
+    /// [`ts_core::OrderStatus`] state machine. Always non-decreasing.
+    /// Engines with no out-of-band updates (e.g. [`PaperEngine`]) return
+    /// `0` since they construct every report inline. Surfaced as a
+    /// Prometheus counter by the live runner.
+    fn illegal_transitions(&self) -> u64 {
+        0
+    }
 }
 
 impl<S: Strategy> OrderEngine for PaperEngine<S> {
