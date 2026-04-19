@@ -68,6 +68,22 @@ pub trait OrderEngine {
     fn illegal_transitions(&self) -> u64 {
         0
     }
+
+    /// Client order ids the engine still considers live — i.e. orders
+    /// that have been submitted and have not yet reached a terminal
+    /// [`ts_core::OrderStatus`]. The default returns an empty vec for
+    /// engines that don't track per-order state (backtest shims,
+    /// stateless test doubles). The live runner uses this as a defence
+    /// in depth on the kill-switch trip sweep: after the strategy's
+    /// `on_shutdown` has emitted its cancel list, the sweep cancels
+    /// every remaining open cid the engine still knows about, so a
+    /// strategy bug can't silently leave orders hanging on the venue.
+    ///
+    /// Return order is not specified; callers that need determinism
+    /// should sort.
+    fn open_cids(&self) -> Vec<ClientOrderId> {
+        Vec::new()
+    }
 }
 
 impl<S: Strategy> OrderEngine for PaperEngine<S> {
@@ -87,6 +103,10 @@ impl<S: Strategy> OrderEngine for PaperEngine<S> {
 
     fn reconcile(&mut self) -> Result<EngineStep, Self::Error> {
         Ok(EngineStep::default())
+    }
+
+    fn open_cids(&self) -> Vec<ClientOrderId> {
+        self.live_orders().keys().cloned().collect()
     }
 }
 

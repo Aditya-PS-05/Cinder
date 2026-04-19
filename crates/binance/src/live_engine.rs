@@ -339,6 +339,14 @@ impl<A: BinanceOrderApi> OrderEngine for BinanceLiveEngine<A> {
         self.illegal_transitions
     }
 
+    fn open_cids(&self) -> Vec<ClientOrderId> {
+        // `symbol_by_cid` mirrors the set of cids the engine still
+        // considers live — `reconcile` removes the entry on terminal
+        // status, so this is always consistent with the cached last-
+        // known status without a separate filter pass.
+        self.symbol_by_cid.keys().cloned().collect()
+    }
+
     fn reconcile(&mut self) -> Result<EngineStep, Self::Error> {
         let mut step = EngineStep::default();
         while let Ok(report) = self.rx.try_recv() {

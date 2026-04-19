@@ -58,6 +58,12 @@ pub struct LiveSummary {
     pub orders_expired: u64,
     pub fills: u64,
     pub reconcile_errors: u64,
+    /// Cancels fired by the kill-switch trip sweep against cids that
+    /// `Strategy::on_shutdown` failed to return but that the engine
+    /// still considered live. Non-zero here indicates a strategy bug:
+    /// the runner cleaned up, but the strategy's shutdown path is not
+    /// trustworthy and should be fixed.
+    pub trip_sweep_orphan_cancels: u64,
 }
 
 /// Driver around an [`OrderEngine`] + [`Strategy`] + local [`OrderBook`].
@@ -307,21 +313,54 @@ impl<E: OrderEngine> LiveRunner<E> {
         self.swept_after_trip = true;
         warn!("live-runner: kill switch tripped; running cancel sweep");
         let actions = self.strategy.on_shutdown();
+        let mut handled: HashSet<ClientOrderId> = HashSet::new();
         for action in actions {
             match action {
-                StrategyAction::Cancel(cid) => match self.engine.cancel(&cid) {
-                    Ok(report) => self.observe_report(report).await,
-                    Err(err) => {
-                        error!(error = %err, "live-runner: trip-sweep cancel failed");
-                        self.summary.reconcile_errors += 1;
+                StrategyAction::Cancel(cid) => {
+                    handled.insert(cid.clone());
+                    match self.engine.cancel(&cid) {
+                        Ok(report) => self.observe_report(report).await,
+                        Err(err) => {
+                            error!(error = %err, "live-runner: trip-sweep cancel failed");
+                            self.summary.reconcile_errors += 1;
+                        }
                     }
-                },
+                }
                 StrategyAction::Place(order) => {
                     // `on_shutdown` is contractually cancel-only; a
                     // Place here would be a strategy bug. Log once
                     // and drop — we never want to open new risk after
                     // a trip.
                     warn!(cid = ?order.cid, "live-runner: dropping Place from on_shutdown during trip sweep");
+                }
+            }
+        }
+        // Defense in depth: the strategy might have forgotten an open
+        // cid (bug, half-ticked state, etc.). The engine is the
+        // authoritative source for "what's actually live on the
+        // venue," so cancel any cids it still tracks that the
+        // strategy didn't hand us. Snapshot first — each successful
+        // cancel mutates `open_cids()` on engines that track live
+        // state inline.
+        let orphans: Vec<ClientOrderId> = self
+            .engine
+            .open_cids()
+            .into_iter()
+            .filter(|cid| !handled.contains(cid))
+            .collect();
+        for cid in orphans {
+            warn!(
+                cid = %cid.as_str(),
+                "live-runner: trip sweep cancelling cid strategy did not surface"
+            );
+            match self.engine.cancel(&cid) {
+                Ok(report) => {
+                    self.summary.trip_sweep_orphan_cancels += 1;
+                    self.observe_report(report).await;
+                }
+                Err(err) => {
+                    error!(error = %err, "live-runner: trip-sweep orphan cancel failed");
+                    self.summary.reconcile_errors += 1;
                 }
             }
         }
@@ -917,7 +956,8 @@ mod tests {
     };
     use ts_core::{
         BookLevel, BookSnapshot, ClientOrderId, ExecReport, InstrumentSpec, MarketEvent,
-        MarketPayload, OrderStatus, Price, Qty, Side, Symbol, Timestamp, Venue,
+        MarketPayload, NewOrder, OrderKind, OrderStatus, Price, Qty, Side, Symbol, TimeInForce,
+        Timestamp, Venue,
     };
     use ts_strategy::InventorySkewMaker;
     use ts_strategy::MakerConfig;
@@ -1511,6 +1551,101 @@ mod tests {
             summary.orders_canceled, 4,
             "trip sweep must cancel both open quotes; summary={summary:?}"
         );
+    }
+
+    /// Strategy that submits exactly one order on its first
+    /// `on_book_update` and then does nothing — crucially, its
+    /// `on_shutdown` is empty, simulating the class of strategy bug
+    /// where the shutdown path forgets to return live cids. The
+    /// runner's trip sweep must catch this via `engine.open_cids()`
+    /// rather than trusting the strategy's output alone.
+    struct ForgetfulCanceler {
+        submitted: bool,
+    }
+    impl Strategy for ForgetfulCanceler {
+        fn on_book_update(&mut self, now: Timestamp, _book: &OrderBook) -> Vec<StrategyAction> {
+            if self.submitted {
+                return Vec::new();
+            }
+            self.submitted = true;
+            vec![StrategyAction::Place(NewOrder {
+                cid: ClientOrderId::new("forgotten-1"),
+                venue: venue(),
+                symbol: sym(),
+                side: Side::Buy,
+                kind: OrderKind::Limit,
+                tif: TimeInForce::Gtc,
+                qty: Qty(1_000),
+                price: Some(Price(9_900)),
+                ts: now,
+            })]
+        }
+        fn on_fill(&mut self, _fill: &Fill) {}
+        // Deliberately empty: the whole point of the test is that the
+        // runner's defense-in-depth cancels the live cid anyway.
+        fn on_shutdown(&mut self) -> Vec<StrategyAction> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn trip_sweep_cancels_engine_tracked_cids_the_strategy_forgot() {
+        use ts_risk::{KillSwitch, TripReason};
+        // A strategy bug leaves a live cid on the venue with nothing
+        // in `on_shutdown` to cancel it. The runner must still flatten
+        // it when the kill switch trips: iterating `engine.open_cids()`
+        // picks up "forgotten-1", cancels it, and bumps the orphan
+        // counter so operators can see the strategy failed its
+        // contract.
+        let api = QueuedApi::new(vec![
+            Ok(ack("forgotten-1", "NEW")),
+            Ok(ack("forgotten-1", "CANCELED")),
+        ]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 16);
+
+        let ks = Arc::new(KillSwitch::default());
+        let strategy: Box<dyn Strategy> = Box::new(ForgetfulCanceler { submitted: false });
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, strategy, rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+
+        // Let the NEW ack drain so the engine's symbol_by_cid has
+        // "forgotten-1" registered as live.
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        ks.trip(TripReason::Manual);
+
+        // Wait for the reconcile-driven trip sweep to fire. The
+        // strategy returns nothing from on_shutdown, so the only path
+        // that can consume the queued CANCELED ack is the orphan
+        // sweep through engine.open_cids().
+        for _ in 0..80 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(
+            summary.trip_sweep_orphan_cancels, 1,
+            "orphan sweep must cancel the engine-tracked cid the strategy forgot; summary={summary:?}"
+        );
+        // BinanceLiveEngine's cancel returns an optimistic Canceled
+        // synchronously plus an async one via reconcile — 2 reports
+        // per real cancel, matching the pattern in the earlier
+        // trip-sweep test.
+        assert_eq!(summary.orders_canceled, 2);
+        assert_eq!(summary.orders_submitted, 1);
+        assert_eq!(summary.reconcile_errors, 0);
     }
 
     #[tokio::test]
