@@ -22,6 +22,7 @@
 //! and starts from a fresh snapshot.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,11 +79,38 @@ impl SpotStreamConfig {
 pub struct SpotStreamClient {
     cfg: SpotStreamConfig,
     bus: Arc<Bus<MarketEvent>>,
+    /// Cumulative count of forced resyncs across the lifetime of this
+    /// client. Bumped each time [`SymbolResync`] reports
+    /// [`PushOutcome::Resync`] (a sequence-number gap that broke the
+    /// chain). Persists across reconnect cycles so operators can see the
+    /// long-run rate of desync events on a feed; the outer reconnect
+    /// loop reuses the same counter via [`Self::resync_counter`].
+    resync_counter: Arc<AtomicU64>,
 }
 
 impl SpotStreamClient {
     pub fn new(cfg: SpotStreamConfig, bus: Arc<Bus<MarketEvent>>) -> Self {
-        Self { cfg, bus }
+        Self {
+            cfg,
+            bus,
+            resync_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Cumulative count of forced resyncs (sequence-number desyncs that
+    /// flipped a [`SymbolResync`] into [`crate::AlignState::Lost`]) over
+    /// this client's lifetime. Each desync also forces a fresh REST
+    /// snapshot via the reconnect loop, so this is also the count of
+    /// auto-resubscribe events.
+    pub fn resync_count(&self) -> u64 {
+        self.resync_counter.load(Ordering::Relaxed)
+    }
+
+    /// Shared handle to the resync counter so an external observer (e.g.
+    /// a metrics endpoint or a periodic logger) can read the live value
+    /// without holding a reference to the client.
+    pub fn resync_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.resync_counter)
     }
 
     /// Run the reconnect loop forever. Returns only if the caller aborts
@@ -224,15 +252,39 @@ impl SpotStreamClient {
             // defensive — drop the delta rather than publish misaligned.
             return Ok(());
         };
-        match resync.push_delta(evt) {
+        let sym = evt.symbol.clone();
+        let outcome = resync.push_delta(evt);
+        self.dispatch_book_outcome(outcome, &sym)
+    }
+
+    /// Dispatch the resync state machine's verdict on a single delta.
+    /// Extracted so the resync-counter bump and structured warn live in
+    /// one place reachable from the unit tests; production callers go
+    /// through [`Self::route_event`].
+    fn dispatch_book_outcome(
+        &self,
+        outcome: PushOutcome,
+        sym: &Symbol,
+    ) -> Result<(), BinanceError> {
+        match outcome {
             PushOutcome::Buffered => Ok(()),
             PushOutcome::Ready(out) => {
                 self.publish(out);
                 Ok(())
             }
-            PushOutcome::Resync => Err(BinanceError::Align {
-                detail: "live stream gapped; forcing reconnect".to_string(),
-            }),
+            PushOutcome::Resync => {
+                let count = self.resync_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!(
+                    symbol = %sym,
+                    count,
+                    "depth stream gapped; forcing reconnect"
+                );
+                Err(BinanceError::Align {
+                    detail: format!(
+                        "live stream gapped on {sym}; forcing reconnect (cumulative={count})"
+                    ),
+                })
+            }
         }
     }
 
@@ -266,5 +318,151 @@ impl SpotStreamClient {
         if dropped > 0 {
             warn!(delivered, dropped, "slow consumer on bus");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ts_core::{
+        BookDelta, BookLevel, BookSnapshot, MarketEvent, MarketPayload, Price, Qty, Timestamp,
+        Venue,
+    };
+
+    fn sym() -> Symbol {
+        Symbol::from_static("BTCUSDT")
+    }
+
+    fn client() -> SpotStreamClient {
+        let cfg = SpotStreamConfig::new(vec!["BTCUSDT".into()], HashMap::new());
+        SpotStreamClient::new(cfg, Bus::new())
+    }
+
+    fn delta_event(prev_seq: u64, seq: u64) -> MarketEvent {
+        MarketEvent {
+            venue: Venue::BINANCE,
+            symbol: sym(),
+            exchange_ts: Timestamp::default(),
+            local_ts: Timestamp::default(),
+            seq,
+            payload: MarketPayload::BookDelta(BookDelta {
+                bids: vec![BookLevel {
+                    price: Price(100),
+                    qty: Qty(1),
+                }],
+                asks: vec![],
+                prev_seq,
+            }),
+        }
+    }
+
+    /// `Buffered` and `Ready` outcomes must never bump the resync counter
+    /// — the counter is the sole signal operators use to detect a feed
+    /// that's silently desynchronising, so any false positive here would
+    /// cry wolf on a healthy session.
+    #[test]
+    fn dispatch_book_outcome_does_not_bump_counter_on_buffered_or_ready() {
+        let c = client();
+        c.dispatch_book_outcome(PushOutcome::Buffered, &sym())
+            .unwrap();
+        c.dispatch_book_outcome(PushOutcome::Ready(delta_event(0, 1)), &sym())
+            .unwrap();
+        assert_eq!(c.resync_count(), 0);
+    }
+
+    /// A `Resync` outcome must increment the counter once and surface a
+    /// `BinanceError::Align` to the caller so the outer reconnect loop
+    /// re-snapshots and resubscribes. The error string also embeds the
+    /// cumulative count so it lands in operator logs alongside the
+    /// structured `count` field on the warn line.
+    #[test]
+    fn dispatch_book_outcome_bumps_counter_and_errors_on_resync() {
+        let c = client();
+        let err = c
+            .dispatch_book_outcome(PushOutcome::Resync, &sym())
+            .unwrap_err();
+        assert!(matches!(err, BinanceError::Align { .. }));
+        let detail = err.to_string();
+        assert!(
+            detail.contains("BTCUSDT"),
+            "error should name the gapped symbol, got `{detail}`"
+        );
+        assert!(
+            detail.contains("cumulative=1"),
+            "error should embed cumulative count, got `{detail}`"
+        );
+        assert_eq!(c.resync_count(), 1);
+    }
+
+    /// Counter is cumulative across calls; multiple gaps within the
+    /// lifetime of one client should reflect in `resync_count`. Mirrors
+    /// how the production loop holds onto the same `SpotStreamClient`
+    /// across reconnect cycles via the same `Arc<AtomicU64>`.
+    #[test]
+    fn dispatch_book_outcome_counter_is_cumulative() {
+        let c = client();
+        for _ in 0..3 {
+            let _ = c.dispatch_book_outcome(PushOutcome::Resync, &sym());
+        }
+        assert_eq!(c.resync_count(), 3);
+        // External observers reading the shared counter see the same
+        // value — important for downstream metrics endpoints that hold
+        // an `Arc` rather than the client itself.
+        assert_eq!(c.resync_counter().load(Ordering::Relaxed), 3);
+    }
+
+    /// End-to-end through `route_event`: a Lost-state resync emits
+    /// `PushOutcome::Resync` on every push, and the routing path bumps
+    /// the counter accordingly. Non-delta events bypass alignment
+    /// (and therefore the counter) entirely.
+    #[test]
+    fn route_event_increments_counter_on_lost_state_delta() {
+        let c = client();
+        let mut resyncs: HashMap<Symbol, SymbolResync> = HashMap::new();
+        let mut s = SymbolResync::new();
+        // Drive the resync into Lost state: snapshot at 20 with a
+        // post-snapshot gap (delta U=30 has no bridge).
+        let _ = s.apply_snapshot(
+            MarketEvent {
+                venue: Venue::BINANCE,
+                symbol: sym(),
+                exchange_ts: Timestamp::default(),
+                local_ts: Timestamp::default(),
+                seq: 20,
+                payload: MarketPayload::BookSnapshot(BookSnapshot {
+                    bids: vec![],
+                    asks: vec![],
+                }),
+            },
+            20,
+        );
+        // Push a delta whose first_update_id is past the bridge window.
+        let _ = s.push_delta(delta_event(29, 30));
+        resyncs.insert(sym(), s);
+
+        // Now an additional delta hits the Lost state and forces resync.
+        let err = c
+            .route_event(delta_event(31, 32), &mut resyncs)
+            .unwrap_err();
+        assert!(matches!(err, BinanceError::Align { .. }));
+        assert_eq!(c.resync_count(), 1);
+
+        // A non-delta event must not advance the counter even on a Lost
+        // resync — alignment doesn't apply, so the bus publish path runs.
+        let trade = MarketEvent {
+            venue: Venue::BINANCE,
+            symbol: sym(),
+            exchange_ts: Timestamp::default(),
+            local_ts: Timestamp::default(),
+            seq: 33,
+            payload: MarketPayload::Trade(ts_core::Trade {
+                id: "t1".into(),
+                price: Price(100),
+                qty: Qty(1),
+                taker_side: ts_core::Side::Buy,
+            }),
+        };
+        c.route_event(trade, &mut resyncs).unwrap();
+        assert_eq!(c.resync_count(), 1);
     }
 }
