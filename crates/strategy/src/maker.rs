@@ -1,10 +1,14 @@
 //! Inventory-skew market maker.
 //!
 //! [`InventorySkewMaker`] quotes a symmetric bid/ask pair around the
-//! book mid and shifts both quotes against its current inventory to
-//! encourage mean-reversion back to flat. Each tick cancels any still-
-//! open quotes and reissues fresh ones; when the maker has saturated
-//! its long/short bound it suppresses the corresponding side.
+//! book microprice and shifts both quotes against its current inventory
+//! to encourage mean-reversion back to flat. Centring on microprice
+//! rather than mid leans the quotes toward the thin side of the book —
+//! a queue-imbalance signal that tends to predict the next tick. The
+//! maker falls back to mid whenever microprice is unavailable. Each
+//! tick cancels any still-open quotes and reissues fresh ones; when
+//! the maker has saturated its long/short bound it suppresses the
+//! corresponding side.
 
 use ts_book::OrderBook;
 use ts_core::{
@@ -98,7 +102,7 @@ impl InventorySkewMaker {
 
 impl Strategy for InventorySkewMaker {
     fn on_book_update(&mut self, now: Timestamp, book: &OrderBook) -> Vec<StrategyAction> {
-        let mid = match book.mid() {
+        let centre = match book.microprice().or_else(|| book.mid()) {
             Some(m) => m,
             None => return Vec::new(),
         };
@@ -107,10 +111,10 @@ impl Strategy for InventorySkewMaker {
         // spread is preserved but the center of mass walks away from the
         // side the maker is long on.
         let skew_shift = self.cfg.inventory_skew_ticks.saturating_mul(self.inventory);
-        let bid_px = mid
+        let bid_px = centre
             .saturating_sub(self.cfg.half_spread_ticks)
             .saturating_sub(skew_shift);
-        let ask_px = mid
+        let ask_px = centre
             .saturating_add(self.cfg.half_spread_ticks)
             .saturating_sub(skew_shift);
 
@@ -246,6 +250,22 @@ mod tests {
         assert_eq!(ask.price, Some(Price(110))); // 105 + 5
         assert!(m.open_bid().is_some());
         assert!(m.open_ask().is_some());
+    }
+
+    #[test]
+    fn asymmetric_book_centres_quotes_on_microprice_not_mid() {
+        // mid=105, microprice leans toward the thin side: a heavy bid
+        // queue (qty=30 vs ask qty=10) pulls the fair price up toward
+        // the ask. microprice = (100*10 + 110*30) / 40 = 107.
+        let mut m = InventorySkewMaker::new(cfg());
+        let book = book_with(vec![lvl(100, 30)], vec![lvl(110, 10)]);
+        let actions = m.on_book_update(Timestamp::default(), &book);
+        let bid = place_order(&actions[0]);
+        let ask = place_order(&actions[1]);
+        // half_spread=5, skew=0. bid = 107-5 = 102, ask = 107+5 = 112.
+        // If the maker were still centring on mid=105, we'd see 100/110.
+        assert_eq!(bid.price, Some(Price(102)));
+        assert_eq!(ask.price, Some(Price(112)));
     }
 
     #[test]
