@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use ts_core::MarketEvent;
+use ts_core::{MarketEvent, Price};
 use ts_replay::ReplaySummary;
 use ts_risk::KillSwitch;
 
@@ -181,9 +181,41 @@ impl RunnerMetrics {
         self.ingest_latency_nanos.observe(event.latency_nanos());
     }
 
-    /// Observe counters from a [`LiveSummary`]. The live path doesn't
-    /// maintain its own PnL (that lives in the strategy / a separate
-    /// PnL module), so position, PnL, and mark are left untouched.
+    /// Publish a PnL snapshot sourced from the live runner's
+    /// [`ts_pnl::Accountant`]. `realized_net` and `unrealized` are i128
+    /// mantissas at `price_scale * qty_scale` units; they saturate to
+    /// i64 for the gauge encoding. `mark` controls the `ts_mark_price`
+    /// gauge — `None` suppresses emission (matching the paper path).
+    pub fn observe_pnl(
+        &self,
+        realized_net: i128,
+        unrealized: i128,
+        position: i64,
+        mark: Option<Price>,
+    ) {
+        self.position.store(position, Ordering::Relaxed);
+        self.realized_pnl
+            .store(saturating_i128_to_i64(realized_net), Ordering::Relaxed);
+        self.unrealized_pnl
+            .store(saturating_i128_to_i64(unrealized), Ordering::Relaxed);
+        self.total_pnl.store(
+            saturating_i128_to_i64(realized_net.saturating_add(unrealized)),
+            Ordering::Relaxed,
+        );
+        match mark {
+            Some(p) => {
+                self.mark_price.store(p.0, Ordering::Relaxed);
+                self.mark_known.store(1, Ordering::Relaxed);
+            }
+            None => {
+                self.mark_known.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Observe counters from a [`LiveSummary`]. Position, PnL, and mark
+    /// are populated separately by [`Self::observe_pnl`] from the
+    /// runner's accountant.
     pub fn observe_live(&self, summary: &LiveSummary) {
         self.events_ingested
             .store(summary.events_ingested, Ordering::Relaxed);
@@ -295,7 +327,7 @@ impl RunnerMetrics {
         gauge(
             &mut out,
             "ts_kill_switch_reason",
-            "Trip reason: 0 armed, 1 reject-rate, 2 manual, 3 external.",
+            "Trip reason: 0 armed, 1 reject-rate, 2 manual, 3 external, 4 max-drawdown, 5 daily-loss.",
             self.kill_switch_reason.load(Ordering::Relaxed) as i64,
         );
         self.ingest_latency_nanos.encode(
@@ -304,6 +336,16 @@ impl RunnerMetrics {
             "Exchange→local delivery latency per market event (nanoseconds).",
         );
         out
+    }
+}
+
+fn saturating_i128_to_i64(v: i128) -> i64 {
+    if v > i64::MAX as i128 {
+        i64::MAX
+    } else if v < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        v as i64
     }
 }
 
@@ -500,6 +542,48 @@ mod tests {
         assert!(
             body.contains("ts_ingest_latency_nanos_count 0"),
             "unstamped events must not count, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn observe_pnl_populates_position_realized_unrealized_and_mark() {
+        let m = RunnerMetrics::new();
+        m.observe_pnl(125, 30, -7, Some(Price(12_345)));
+        let body = m.encode_prometheus();
+
+        assert!(body.contains("ts_position -7"), "position, got:\n{body}");
+        assert!(
+            body.contains("ts_realized_pnl 125"),
+            "realized, got:\n{body}"
+        );
+        assert!(
+            body.contains("ts_unrealized_pnl 30"),
+            "unrealized, got:\n{body}"
+        );
+        assert!(body.contains("ts_total_pnl 155"), "total, got:\n{body}");
+        assert!(
+            body.contains("ts_mark_price 12345"),
+            "mark, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn observe_pnl_saturates_overflow_and_hides_absent_mark() {
+        let m = RunnerMetrics::new();
+        m.observe_pnl(i128::MAX, i128::MIN, 0, None);
+        let body = m.encode_prometheus();
+
+        assert!(
+            body.contains(&format!("ts_realized_pnl {}", i64::MAX)),
+            "realized should saturate to i64::MAX, got:\n{body}"
+        );
+        assert!(
+            body.contains(&format!("ts_unrealized_pnl {}", i64::MIN)),
+            "unrealized should saturate to i64::MIN, got:\n{body}"
+        );
+        assert!(
+            !body.contains("ts_mark_price"),
+            "mark must be hidden when None, got:\n{body}"
         );
     }
 

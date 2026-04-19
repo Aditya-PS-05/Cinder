@@ -294,12 +294,26 @@ impl<E: OrderEngine> LiveRunner<E> {
         self.evaluate_pnl_guard();
     }
 
-    /// Re-evaluate the configured [`PnlGuard`] against the current
-    /// accountant state and trip the kill switch on a breach. A no-op
-    /// when either the guard or the kill switch is unattached, when the
-    /// switch is already tripped, or when the guard sees no threshold
-    /// crossed.
+    /// Compute the PnL snapshot (realized net, unrealized, position,
+    /// mark) from the accountant and publish it to `RunnerMetrics`;
+    /// then re-evaluate the configured [`PnlGuard`] and trip the kill
+    /// switch on a breach. Guard evaluation is a no-op when the guard
+    /// or kill switch is unattached, when the switch is already
+    /// tripped, or when no threshold is crossed — metrics still
+    /// publish on every call.
     fn evaluate_pnl_guard(&mut self) {
+        // LiveRunner is single-symbol today; the local book maps to the
+        // strategy's instrument, so any symbol the accountant tracks
+        // gets this book's mid as its mark. If we ever multiplex more
+        // symbols through one runner this closure needs a per-symbol
+        // book lookup.
+        let mark = self.book.mid().map(Price);
+        let realized_net = self.accountant.realized_net_total();
+        let unrealized = self.accountant.unrealized_total(|_| mark);
+        let position = self.accountant.position_total();
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_pnl(realized_net, unrealized, position, mark);
+        }
         let Some(guard) = self.pnl_guard.as_mut() else {
             return;
         };
@@ -309,14 +323,6 @@ impl<E: OrderEngine> LiveRunner<E> {
         if ks.tripped() {
             return;
         }
-        // LiveRunner is single-symbol today; the local book maps to the
-        // strategy's instrument, so any symbol the accountant tracks
-        // gets this book's mid as its mark. If we ever multiplex more
-        // symbols through one runner this closure needs a per-symbol
-        // book lookup.
-        let mark = self.book.mid().map(Price);
-        let realized_net = self.accountant.realized_net_total();
-        let unrealized = self.accountant.unrealized_total(|_| mark);
         if let Some(breach) = guard.observe(Instant::now(), realized_net, unrealized) {
             warn!(
                 ?breach,

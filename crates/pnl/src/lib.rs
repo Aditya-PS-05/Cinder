@@ -93,6 +93,13 @@ impl Accountant {
         self.books.values().map(|b| b.realized).sum()
     }
 
+    /// Sum of signed positions across every symbol seen. Meaningful as a
+    /// scalar for single-symbol runners; multi-symbol callers should
+    /// prefer per-symbol [`Self::position`] lookups.
+    pub fn position_total(&self) -> i64 {
+        self.books.values().map(|b| b.position).sum()
+    }
+
     /// Cumulative fees paid on `symbol` (quote-currency only).
     pub fn fees(&self, symbol: &Symbol) -> i128 {
         self.books.get(symbol).map_or(0, |b| b.fees)
