@@ -192,6 +192,12 @@
       "type": "file"
     },
     {
+      "path": "crates/book/src/lib.rs",
+      "accessCount": 5,
+      "lastAccessed": 1776565230458,
+      "type": "file"
+    },
+    {
       "path": "crates/binance/src/decode.rs",
       "accessCount": 4,
       "lastAccessed": 1776372764658,
@@ -387,12 +393,6 @@
       "path": "crates/book/Cargo.toml",
       "accessCount": 1,
       "lastAccessed": 1776243021533,
-      "type": "file"
-    },
-    {
-      "path": "crates/book/src/lib.rs",
-      "accessCount": 1,
-      "lastAccessed": 1776243064205,
       "type": "file"
     },
     {

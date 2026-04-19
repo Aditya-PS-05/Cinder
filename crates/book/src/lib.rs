@@ -117,6 +117,60 @@ impl OrderBook {
         Some(self.best_ask()?.price.0 - self.best_bid()?.price.0)
     }
 
+    /// Top-of-book microprice in the same fixed-point scale as the
+    /// underlying levels:
+    ///
+    /// ```text
+    ///   microprice = (bid_price * ask_qty + ask_price * bid_qty)
+    ///                / (bid_qty + ask_qty)
+    /// ```
+    ///
+    /// The weighting is inverted on purpose: a heavy bid queue and a
+    /// thin ask queue pull the fair price toward the ask, matching the
+    /// intuition that the next trade is more likely to lift the offer.
+    /// Returns `None` when either side is empty or the combined top
+    /// quantity is zero.
+    ///
+    /// Integer division rounds toward zero so the value stays on the
+    /// same scale as `mid()` and `best_bid()` / `best_ask()`. Products
+    /// and the numerator are computed in `i128` so realistic
+    /// `price * qty` values cannot overflow.
+    pub fn microprice(&self) -> Option<i64> {
+        let bid = self.best_bid()?;
+        let ask = self.best_ask()?;
+        let bq = bid.qty.0 as i128;
+        let aq = ask.qty.0 as i128;
+        let denom = bq + aq;
+        if denom == 0 {
+            return None;
+        }
+        let num = (bid.price.0 as i128) * aq + (ask.price.0 as i128) * bq;
+        Some((num / denom) as i64)
+    }
+
+    /// Top-of-book order-flow imbalance in `[-1.0, 1.0]`:
+    ///
+    /// ```text
+    ///   imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty)
+    /// ```
+    ///
+    /// Positive values mean bid-heavy (buying pressure), negative
+    /// values mean ask-heavy (selling pressure). Returns `None` when
+    /// either side is empty or the combined top quantity is zero —
+    /// callers should treat `None` as "no signal" rather than defaulting
+    /// to a numeric value.
+    pub fn imbalance(&self) -> Option<f64> {
+        let bid = self.best_bid()?;
+        let ask = self.best_ask()?;
+        let bq = bid.qty.0 as f64;
+        let aq = ask.qty.0 as f64;
+        let denom = bq + aq;
+        if denom == 0.0 {
+            return None;
+        }
+        Some((bq - aq) / denom)
+    }
+
     /// Snapshot the top `n` levels of each side as a [`BookSnapshot`].
     /// Bids come out descending, asks ascending.
     pub fn top_n(&self, n: usize) -> BookSnapshot {
@@ -302,6 +356,87 @@ mod tests {
         b.apply_snapshot(&snap(vec![lvl(100, 1)], vec![]), 1);
         assert_eq!(b.mid(), None);
         assert_eq!(b.spread(), None);
+    }
+
+    #[test]
+    fn microprice_is_mid_when_top_quantities_match() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&snap(vec![lvl(100, 5)], vec![lvl(110, 5)]), 1);
+        // Equal queues: microprice collapses to the integer mid.
+        assert_eq!(b.microprice(), Some(105));
+        assert_eq!(b.mid(), Some(105));
+    }
+
+    #[test]
+    fn microprice_leans_toward_ask_when_bid_queue_is_heavier() {
+        let mut b = OrderBook::new();
+        // Bid queue 10x the ask queue → microprice pushed toward ask.
+        b.apply_snapshot(&snap(vec![lvl(100, 100)], vec![lvl(110, 10)]), 1);
+        let mp = b.microprice().expect("book is two-sided");
+        assert!(
+            mp > b.mid().unwrap(),
+            "microprice {mp} should sit above mid {} under buy pressure",
+            b.mid().unwrap()
+        );
+        // (100*10 + 110*100) / 110 = 12000/110 = 109
+        assert_eq!(mp, 109);
+    }
+
+    #[test]
+    fn microprice_leans_toward_bid_when_ask_queue_is_heavier() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&snap(vec![lvl(100, 10)], vec![lvl(110, 100)]), 1);
+        let mp = b.microprice().expect("book is two-sided");
+        assert!(mp < b.mid().unwrap());
+        // (100*100 + 110*10) / 110 = 11100/110 = 100
+        assert_eq!(mp, 100);
+    }
+
+    #[test]
+    fn microprice_is_none_when_a_side_is_empty() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&snap(vec![lvl(100, 1)], vec![]), 1);
+        assert_eq!(b.microprice(), None);
+    }
+
+    #[test]
+    fn imbalance_is_zero_for_symmetric_top_of_book() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&snap(vec![lvl(100, 7)], vec![lvl(110, 7)]), 1);
+        assert_eq!(b.imbalance(), Some(0.0));
+    }
+
+    #[test]
+    fn imbalance_sign_tracks_dominant_side() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&snap(vec![lvl(100, 30)], vec![lvl(110, 10)]), 1);
+        let imb = b.imbalance().unwrap();
+        assert!(
+            imb > 0.0,
+            "bid-heavy book should produce positive imbalance"
+        );
+        assert!((imb - 0.5).abs() < 1e-9, "got {imb}");
+
+        b.apply_snapshot(&snap(vec![lvl(100, 10)], vec![lvl(110, 30)]), 2);
+        let imb = b.imbalance().unwrap();
+        assert!(imb < 0.0);
+        assert!((imb + 0.5).abs() < 1e-9, "got {imb}");
+    }
+
+    #[test]
+    fn imbalance_saturates_at_one_when_a_side_has_trivial_size() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&snap(vec![lvl(100, 1_000_000)], vec![lvl(110, 1)]), 1);
+        let imb = b.imbalance().unwrap();
+        assert!((-1.0..=1.0).contains(&imb));
+        assert!(imb > 0.999, "near-saturated bid queue got {imb}");
+    }
+
+    #[test]
+    fn imbalance_is_none_when_a_side_is_empty() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&snap(vec![], vec![lvl(110, 10)]), 1);
+        assert_eq!(b.imbalance(), None);
     }
 
     #[test]
