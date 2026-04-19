@@ -503,6 +503,8 @@ mod tests {
             qty: Qty(3),
             ts: Timestamp::default(),
             is_maker: None,
+            fee: 0,
+            fee_asset: None,
         };
         // The engine's strategy is private; poke inventory through a synthetic
         // fill by submitting and filling a marketable order.

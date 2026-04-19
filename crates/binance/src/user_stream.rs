@@ -30,8 +30,8 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
 use ts_core::{
-    ClientOrderId, ExecReport, Fill, InstrumentSpec, OrderStatus, Price, Qty, Side, Symbol,
-    Timestamp, Venue,
+    decimal::parse_decimal, ClientOrderId, ExecReport, Fill, InstrumentSpec, OrderStatus, Price,
+    Qty, Side, Symbol, Timestamp, Venue,
 };
 
 use crate::error::BinanceError;
@@ -247,6 +247,7 @@ fn decode_execution_report_value(
     let mut fills = Vec::new();
     if last_qty.0 > 0 {
         let last_price = Price::from_str(&raw.last_exec_price, spec.price_scale)?;
+        let (fee, fee_asset) = decode_commission(&raw.commission, &raw.commission_asset, spec)?;
         fills.push(Fill {
             cid: cid.clone(),
             venue: venue.clone(),
@@ -256,6 +257,8 @@ fn decode_execution_report_value(
             qty: last_qty,
             ts,
             is_maker: Some(raw.is_maker),
+            fee,
+            fee_asset,
         });
     }
 
@@ -340,6 +343,39 @@ struct RawExecutionReport {
     /// present on executionReport frames that carry an actual fill.
     #[serde(rename = "m", default)]
     is_maker: bool,
+    /// Commission charged on this trade, reported as a decimal string.
+    /// Blank on non-fill frames.
+    #[serde(rename = "n", default)]
+    commission: String,
+    /// Asset the commission was denominated in (`"USDT"`, `"BNB"`, …).
+    /// Blank on non-fill frames.
+    #[serde(rename = "N", default)]
+    commission_asset: String,
+}
+
+/// Decode the `n` / `N` commission pair off a fill frame.
+///
+/// When the commission asset matches `spec.quote`, the numeric value is
+/// parsed at `price_scale + qty_scale` so it lands in the same mantissa
+/// PnL accumulates in. Cross-asset commissions (BNB discount, base-asset
+/// rebates) return `fee = 0` with the asset label preserved so operators
+/// can still see them in the audit trail — converting them to quote
+/// terms needs a cross-asset mark that the decoder does not own.
+fn decode_commission(
+    commission: &str,
+    asset: &str,
+    spec: &InstrumentSpec,
+) -> Result<(i64, Option<String>), crate::error::BinanceError> {
+    if commission.is_empty() || asset.is_empty() {
+        return Ok((0, None));
+    }
+    let label = Some(asset.to_string());
+    if !asset.eq_ignore_ascii_case(&spec.quote) {
+        return Ok((0, label));
+    }
+    let scale = spec.price_scale + spec.qty_scale;
+    let mantissa = parse_decimal(commission, scale)?;
+    Ok((mantissa, label))
 }
 
 #[cfg(test)]

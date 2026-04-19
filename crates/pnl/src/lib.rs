@@ -42,8 +42,17 @@ pub struct SymbolBook {
     /// Weighted-average entry price in price-scale mantissa. Zero
     /// when `position == 0`.
     pub avg_entry: i64,
-    /// Cumulative realized pnl in `price_scale * qty_scale` units.
+    /// Cumulative realized pnl *before* fees in `price_scale * qty_scale`
+    /// units. Stays at gross for reconciliation; net figures come from
+    /// subtracting [`Self::fees`].
     pub realized: i128,
+    /// Cumulative commissions paid on this symbol's fills, at the same
+    /// `price_scale + qty_scale` mantissa as [`Self::realized`]. Only
+    /// fees denominated in the instrument's quote currency fold in here;
+    /// cross-asset commissions are captured on the originating [`Fill`]
+    /// with a zero mantissa so the asset label survives but the value
+    /// does not skew PnL under an unknown conversion rate.
+    pub fees: i128,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -78,9 +87,30 @@ impl Accountant {
         self.books.get(symbol).map_or(0, |b| b.realized)
     }
 
-    /// Sum of realized pnl across every symbol seen.
+    /// Sum of realized pnl across every symbol seen. Gross — see
+    /// [`Self::realized_net_total`] for the fee-adjusted figure.
     pub fn realized_total(&self) -> i128 {
         self.books.values().map(|b| b.realized).sum()
+    }
+
+    /// Cumulative fees paid on `symbol` (quote-currency only).
+    pub fn fees(&self, symbol: &Symbol) -> i128 {
+        self.books.get(symbol).map_or(0, |b| b.fees)
+    }
+
+    /// Sum of quote-denominated commissions across every symbol seen.
+    pub fn fees_total(&self) -> i128 {
+        self.books.values().map(|b| b.fees).sum()
+    }
+
+    /// Realized pnl on `symbol` net of cumulative commissions.
+    pub fn realized_net(&self, symbol: &Symbol) -> i128 {
+        self.books.get(symbol).map_or(0, |b| b.realized - b.fees)
+    }
+
+    /// Portfolio-wide realized pnl net of cumulative commissions.
+    pub fn realized_net_total(&self) -> i128 {
+        self.realized_total() - self.fees_total()
     }
 
     /// Unrealized pnl for a symbol given the current mark price.
@@ -111,7 +141,11 @@ impl Accountant {
             .sum()
     }
 
-    /// Fold a single fill into the book for its symbol.
+    /// Fold a single fill into the book for its symbol. Quote-denominated
+    /// commissions on the fill accumulate into [`SymbolBook::fees`];
+    /// cross-asset commissions (conveyed with `fill.fee == 0` and a
+    /// non-quote label) are intentionally skipped here — converting
+    /// them to quote is out of scope for the accountant.
     pub fn on_fill(&mut self, fill: &Fill) {
         if fill.qty.0 <= 0 {
             return;
@@ -123,6 +157,9 @@ impl Accountant {
         };
         let book = self.books.entry(fill.symbol.clone()).or_default();
         apply_fill(book, signed_qty, fill.price.0);
+        if fill.fee != 0 {
+            book.fees += fill.fee as i128;
+        }
     }
 }
 
@@ -209,6 +246,8 @@ mod tests {
             qty: Qty(qty),
             ts: Timestamp::default(),
             is_maker: None,
+            fee: 0,
+            fee_asset: None,
         }
     }
 
@@ -357,5 +396,56 @@ mod tests {
         let mut a = Accountant::new();
         a.on_fill(&fill(Side::Buy, 100, 0));
         assert_eq!(a.position(&sym()), 0);
+    }
+
+    fn fill_with_fee(side: Side, price: i64, qty: i64, fee: i64, asset: &str) -> Fill {
+        let mut f = fill(side, price, qty);
+        f.fee = fee;
+        f.fee_asset = Some(asset.to_string());
+        f
+    }
+
+    #[test]
+    fn quote_fee_reduces_realized_net_but_keeps_gross_intact() {
+        let mut a = Accountant::new();
+        // Open long 10 @ 100 costing 2 USDT in commission.
+        a.on_fill(&fill_with_fee(Side::Buy, 100, 10, 2, "USDT"));
+        // Close at 120 paying another 3 USDT in commission.
+        a.on_fill(&fill_with_fee(Side::Sell, 120, 10, 3, "USDT"));
+
+        assert_eq!(
+            a.realized(&sym()),
+            (120 - 100) * 10,
+            "gross stays untouched"
+        );
+        assert_eq!(a.fees(&sym()), 5);
+        assert_eq!(a.realized_net(&sym()), 200 - 5);
+        assert_eq!(a.realized_net_total(), 195);
+    }
+
+    #[test]
+    fn cross_asset_fee_is_captured_on_fill_but_skipped_by_accountant() {
+        // BNB-discounted commission — the decoder emits fee=0 with the
+        // asset label preserved. The accountant must not treat it as
+        // a quote-denominated value.
+        let mut a = Accountant::new();
+        a.on_fill(&fill_with_fee(Side::Buy, 100, 10, 0, "BNB"));
+        a.on_fill(&fill_with_fee(Side::Sell, 120, 10, 0, "BNB"));
+        assert_eq!(a.realized(&sym()), 200);
+        assert_eq!(a.fees(&sym()), 0);
+        assert_eq!(a.realized_net_total(), 200);
+    }
+
+    #[test]
+    fn fees_total_sums_across_symbols() {
+        let mut a = Accountant::new();
+        a.on_fill(&fill_with_fee(Side::Buy, 100, 10, 1, "USDT"));
+        let mut eth = fill_with_fee(Side::Buy, 3_000, 1, 4, "USDT");
+        eth.symbol = Symbol::from_static("ETHUSDT");
+        a.on_fill(&eth);
+
+        assert_eq!(a.fees(&sym()), 1);
+        assert_eq!(a.fees(&Symbol::from_static("ETHUSDT")), 4);
+        assert_eq!(a.fees_total(), 5);
     }
 }

@@ -118,6 +118,8 @@ mod tests {
             qty: Qty(2),
             ts: Timestamp::from_unix_millis(1_700_000_000_000),
             is_maker: None,
+            fee: 0,
+            fee_asset: None,
         }
     }
 

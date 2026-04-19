@@ -620,6 +620,8 @@ mod tests {
                 qty: Qty(100_000),
                 ts: Timestamp::default(),
                 is_maker: None,
+                fee: 0,
+                fee_asset: None,
             }],
         };
         inbound.send(report).await.unwrap();

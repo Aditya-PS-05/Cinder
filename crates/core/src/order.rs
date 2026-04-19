@@ -85,6 +85,18 @@ pub struct Fill {
     /// `m` flag.
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_maker: Option<bool>,
+    /// Commission charged on this fill, in quote-currency mantissa
+    /// at `price_scale + qty_scale` (the same mantissa PnL uses). Zero
+    /// when the commission was paid in a non-quote asset — the asset
+    /// label lands in `fee_asset` so the value is still auditable
+    /// even though we can't fold it into realized PnL without a
+    /// cross-asset mark.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fee: i64,
+    /// Asset the commission was denominated in (e.g. `"USDT"`, `"BNB"`).
+    /// `None` when the source doesn't report it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fee_asset: Option<String>,
 }
 
 /// Terminal result of submitting a single order: every fill that

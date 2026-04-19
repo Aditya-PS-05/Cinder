@@ -63,8 +63,14 @@ pub struct SymbolReport {
     /// Weighted-average entry price at end-of-tape in price-scale
     /// mantissa. `None` when the position is flat.
     pub avg_entry: Option<i64>,
-    /// Realized pnl at end-of-tape in `price_scale * qty_scale` mantissa.
+    /// Gross realized pnl at end-of-tape in `price_scale * qty_scale`
+    /// mantissa, before fees.
     pub realized: i128,
+    /// Cumulative quote-denominated commissions paid on this symbol's
+    /// fills, at the same mantissa as [`Self::realized`].
+    pub fees: i128,
+    /// `realized - fees` precomputed for convenience.
+    pub realized_net: i128,
 }
 
 /// Breakdown of fill liquidity based on the `is_maker` flag carried on
@@ -106,8 +112,13 @@ pub struct Report {
     pub fills_seen: u64,
     pub statuses: StatusCounters,
     pub symbols: BTreeMap<String, SymbolReport>,
-    /// Sum of realized pnl across every symbol.
+    /// Sum of gross realized pnl across every symbol, before fees.
     pub realized_total: i128,
+    /// Sum of quote-denominated commissions across every symbol.
+    pub fees_total: i128,
+    /// `realized_total - fees_total`. Surfaced for convenience so
+    /// downstream dashboards don't have to recompute it.
+    pub realized_net_total: i128,
     pub liquidity: LiquidityBreakdown,
     pub quant: QuantMetrics,
     /// First and last timestamped fill seen on the tape. Drives
@@ -212,11 +223,14 @@ impl Report {
     /// equity curve. Call after the last `ingest`.
     pub fn finalize(&mut self, accountant: &Accountant) {
         let mut total: i128 = 0;
+        let mut fees_total: i128 = 0;
         for (sym_str, entry) in self.symbols.iter_mut() {
             let sym = Symbol::new(sym_str.clone());
             if let Some(book) = accountant.book(&sym) {
                 entry.end_position = book.position;
                 entry.realized = book.realized;
+                entry.fees = book.fees;
+                entry.realized_net = book.realized - book.fees;
                 entry.avg_entry = if book.position == 0 {
                     None
                 } else {
@@ -224,8 +238,11 @@ impl Report {
                 };
             }
             total += entry.realized;
+            fees_total += entry.fees;
         }
         self.realized_total = total;
+        self.fees_total = fees_total;
+        self.realized_net_total = total - fees_total;
         self.quant = derive_quant(
             &self.equity_curve,
             self.fills_seen,
@@ -381,8 +398,16 @@ pub fn format_text(report: &Report, stats: &ReadStats) -> String {
     }
 
     out.push_str(&format!(
-        "\nrealized pnl (sum across symbols): {}\n",
+        "\nrealized pnl gross (sum across symbols): {}\n",
         report.realized_total
+    ));
+    out.push_str(&format!(
+        "fees   (quote-denominated):        {}\n",
+        report.fees_total
+    ));
+    out.push_str(&format!(
+        "realized pnl net (gross - fees):   {}\n",
+        report.realized_net_total
     ));
 
     out.push_str("\n-- liquidity --\n");
@@ -468,6 +493,8 @@ mod tests {
             qty: Qty(qty),
             ts,
             is_maker,
+            fee: 0,
+            fee_asset: None,
         })
     }
 
@@ -598,7 +625,8 @@ mod tests {
         assert!(text.contains("fills:      2"));
         assert!(text.contains("BTCUSDT"));
         assert!(text.contains("realized=50"));
-        assert!(text.contains("realized pnl (sum across symbols): 50"));
+        assert!(text.contains("realized pnl gross (sum across symbols): 50"));
+        assert!(text.contains("realized pnl net (gross - fees):   50"));
         assert!(text.contains("-- quant --"));
         assert!(text.contains("-- liquidity --"));
     }
