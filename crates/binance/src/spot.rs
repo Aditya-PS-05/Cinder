@@ -20,6 +20,17 @@
 //! Slow bus consumers drop messages, never the producer. Alignment
 //! gaps return [`BinanceError::Align`] so the outer loop reconnects
 //! and starts from a fresh snapshot.
+//!
+//! ## Reconnect backoff
+//!
+//! The outer loop in [`SpotStreamClient::run`] applies exponential
+//! backoff bounded by [`SpotStreamConfig::max_backoff`] and scatters
+//! each delay with uniform jitter of
+//! [`SpotStreamConfig::jitter_ratio`]. The jitter is load-correlation
+//! insurance: when Binance cycles a front-end and every client on the
+//! planet reconnects at the same deterministic interval, their
+//! retries collide. Spreading each client's retry across
+//! `[base*(1-r), base*(1+r)]` de-synchronises the herd.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,6 +72,15 @@ pub struct SpotStreamConfig {
     pub initial_backoff: Duration,
     /// Upper bound on the reconnect delay.
     pub max_backoff: Duration,
+    /// Half-width of the uniform jitter window around each computed
+    /// backoff, as a fraction in `[0.0, 1.0]`. `0.0` disables jitter
+    /// (deterministic exponential backoff); `0.2` scatters each delay
+    /// across `[base * 0.8, base * 1.2]`. Values outside the range are
+    /// clamped by [`jittered_backoff`]. The default of `0.2` is a
+    /// compromise: small enough that the backoff curve still tracks
+    /// `base`, large enough to de-correlate thousands of clients
+    /// retrying after a shared outage.
+    pub jitter_ratio: f64,
 }
 
 impl SpotStreamConfig {
@@ -72,7 +92,61 @@ impl SpotStreamConfig {
             specs,
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
+            jitter_ratio: 0.2,
         }
+    }
+}
+
+/// Pure: scale `base` by `(1 - ratio) + 2 * ratio * rand_01` so the
+/// result falls in `[base * (1 - ratio), base * (1 + ratio)]`. Callers
+/// supply `rand_01` — production uses [`XorShiftRng`], tests pass
+/// literal values for deterministic bounds checks. Both `ratio` and
+/// `rand_01` are clamped to `[0.0, 1.0]` to keep the output
+/// non-negative and bounded even with a misconfigured caller.
+pub(crate) fn jittered_backoff(base: Duration, ratio: f64, rand_01: f64) -> Duration {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let r = rand_01.clamp(0.0, 1.0);
+    let scale = (1.0 - ratio) + (2.0 * ratio * r);
+    let nanos_f = (base.as_nanos() as f64) * scale;
+    if nanos_f <= 0.0 {
+        return Duration::ZERO;
+    }
+    let clamped = nanos_f.min(u64::MAX as f64);
+    Duration::from_nanos(clamped as u64)
+}
+
+/// Minimal xorshift64 so we can jitter without taking a new workspace
+/// dependency. The quality is fine for de-synchronising reconnect
+/// storms; do not reuse for anything cryptographic.
+#[derive(Debug)]
+pub(crate) struct XorShiftRng {
+    state: u64,
+}
+
+impl XorShiftRng {
+    pub(crate) fn seed_from_time() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Self::from_seed(nanos)
+    }
+
+    pub(crate) fn from_seed(seed: u64) -> Self {
+        // xorshift requires a non-zero state.
+        Self { state: seed | 1 }
+    }
+
+    /// Uniform float in `[0.0, 1.0)`. Uses the high 53 bits, which is
+    /// the standard way to get a full-precision `f64` in `[0, 1)`
+    /// without rounding bias.
+    pub(crate) fn next_01(&mut self) -> f64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        ((x >> 11) as f64) / ((1u64 << 53) as f64)
     }
 }
 
@@ -115,9 +189,13 @@ impl SpotStreamClient {
 
     /// Run the reconnect loop forever. Returns only if the caller aborts
     /// the task or [`Bus::close`] has been called and there is nothing
-    /// left to publish.
+    /// left to publish. Each sleep between attempts is drawn from
+    /// [`jittered_backoff`] around the current exponential base so
+    /// reconnect storms after a venue-wide outage don't stampede the
+    /// edge in lockstep.
     pub async fn run(&self) {
         let mut backoff = self.cfg.initial_backoff;
+        let mut rng = XorShiftRng::seed_from_time();
         loop {
             match self.session().await {
                 Ok(()) => {
@@ -128,8 +206,14 @@ impl SpotStreamClient {
                     error!(error = %e, "binance spot session failed");
                 }
             }
-            warn!(?backoff, "reconnecting to binance spot");
-            sleep(backoff).await;
+            let delay = jittered_backoff(backoff, self.cfg.jitter_ratio, rng.next_01());
+            warn!(
+                ?delay,
+                ?backoff,
+                jitter_ratio = self.cfg.jitter_ratio,
+                "reconnecting to binance spot"
+            );
+            sleep(delay).await;
             backoff = (backoff * 2).min(self.cfg.max_backoff);
         }
     }
@@ -464,5 +548,128 @@ mod tests {
         };
         c.route_event(trade, &mut resyncs).unwrap();
         assert_eq!(c.resync_count(), 1);
+    }
+
+    /// `jitter_ratio = 0.0` must disable jitter entirely — any value
+    /// from the RNG should collapse back to `base`. This is the escape
+    /// hatch for operators who want deterministic exponential backoff.
+    #[test]
+    fn jittered_backoff_is_identity_at_zero_ratio() {
+        let base = Duration::from_millis(1_000);
+        assert_eq!(jittered_backoff(base, 0.0, 0.0), base);
+        assert_eq!(jittered_backoff(base, 0.0, 0.5), base);
+        assert_eq!(jittered_backoff(base, 0.0, 1.0), base);
+    }
+
+    /// `rand_01 = 0.0` picks the bottom of the jitter window, `1.0`
+    /// picks the top, `0.5` lands back on `base`. These bounds are
+    /// load-bearing: callers rely on the scatter actually scattering
+    /// around `base`, not off to one side.
+    #[test]
+    fn jittered_backoff_respects_ratio_window() {
+        let base = Duration::from_millis(1_000);
+        assert_eq!(jittered_backoff(base, 0.2, 0.0), Duration::from_millis(800));
+        assert_eq!(
+            jittered_backoff(base, 0.2, 1.0),
+            Duration::from_millis(1_200)
+        );
+        assert_eq!(
+            jittered_backoff(base, 0.2, 0.5),
+            Duration::from_millis(1_000)
+        );
+    }
+
+    /// Out-of-range `ratio` and `rand_01` must clamp rather than
+    /// producing negative or wildly scaled delays. A misconfigured
+    /// operator should not be able to ask for an hour-long reconnect
+    /// on a 1s base, or a negative one either.
+    #[test]
+    fn jittered_backoff_clamps_out_of_range_inputs() {
+        let base = Duration::from_millis(1_000);
+        // Negative ratio → treated as 0.
+        assert_eq!(jittered_backoff(base, -5.0, 0.5), base);
+        // Ratio > 1 → clamped to 1 (full 0..2x window).
+        assert_eq!(jittered_backoff(base, 5.0, 0.0), Duration::ZERO);
+        assert_eq!(
+            jittered_backoff(base, 5.0, 1.0),
+            Duration::from_millis(2_000)
+        );
+        // Out-of-range rand_01 → clamped to [0, 1] endpoints.
+        assert_eq!(
+            jittered_backoff(base, 0.2, -1.0),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            jittered_backoff(base, 0.2, 2.0),
+            Duration::from_millis(1_200)
+        );
+    }
+
+    /// A zero base delay stays zero no matter the jitter — important
+    /// so the initial "try immediately" case (if an operator sets
+    /// initial_backoff to Duration::ZERO) isn't stretched by jitter.
+    #[test]
+    fn jittered_backoff_zero_base_stays_zero() {
+        assert_eq!(jittered_backoff(Duration::ZERO, 0.5, 0.5), Duration::ZERO);
+        assert_eq!(jittered_backoff(Duration::ZERO, 1.0, 1.0), Duration::ZERO);
+    }
+
+    /// The xorshift RNG must be deterministic given a fixed seed and
+    /// must keep every draw strictly inside `[0.0, 1.0)`. The
+    /// jitter-window math above assumes this, so a regression here
+    /// would silently produce out-of-bounds delays.
+    #[test]
+    fn xorshift_rng_is_deterministic_and_in_unit_interval() {
+        let mut a = XorShiftRng::from_seed(42);
+        let mut b = XorShiftRng::from_seed(42);
+        for _ in 0..64 {
+            let va = a.next_01();
+            let vb = b.next_01();
+            assert_eq!(va, vb, "same seed must produce same sequence");
+            assert!(
+                (0.0..1.0).contains(&va),
+                "rng must stay in [0, 1), got {va}"
+            );
+        }
+    }
+
+    /// Different seeds must take distinct paths — otherwise the
+    /// de-correlation argument for jitter collapses and every client
+    /// would reconnect on the same jittered schedule.
+    #[test]
+    fn xorshift_rng_differs_across_seeds() {
+        let mut a = XorShiftRng::from_seed(1);
+        let mut b = XorShiftRng::from_seed(2);
+        let mut diverged = false;
+        for _ in 0..16 {
+            if (a.next_01() - b.next_01()).abs() > f64::EPSILON {
+                diverged = true;
+                break;
+            }
+        }
+        assert!(diverged, "distinct seeds should produce distinct streams");
+    }
+
+    /// A zero seed would lock xorshift at 0 forever; `from_seed` sets
+    /// the low bit to defend against that. Verify the guarantee holds
+    /// so a misconfigured 0-valued seed doesn't degrade jitter to a
+    /// constant stream.
+    #[test]
+    fn xorshift_rng_zero_seed_is_rescued() {
+        let mut rng = XorShiftRng::from_seed(0);
+        let a = rng.next_01();
+        let b = rng.next_01();
+        assert!(a > 0.0 && b > 0.0 && (a - b).abs() > f64::EPSILON);
+    }
+
+    /// Default config must ship with jitter enabled — if we ever flip
+    /// the default to 0.0 we lose the herd-protection in production
+    /// without warning. Pin it so such a regression triggers the
+    /// build.
+    #[test]
+    fn default_config_ships_with_nonzero_jitter() {
+        let cfg = SpotStreamConfig::new(vec!["BTCUSDT".into()], HashMap::new());
+        assert!(cfg.jitter_ratio > 0.0);
+        assert!(cfg.jitter_ratio <= 1.0);
     }
 }
