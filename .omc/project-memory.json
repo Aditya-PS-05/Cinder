@@ -126,15 +126,15 @@
       "type": "file"
     },
     {
-      "path": "crates/binance/src/error.rs",
-      "accessCount": 11,
-      "lastAccessed": 1776373197789,
+      "path": "crates/core/src/order.rs",
+      "accessCount": 12,
+      "lastAccessed": 1776540076400,
       "type": "file"
     },
     {
-      "path": "crates/core/src/order.rs",
-      "accessCount": 10,
-      "lastAccessed": 1776359301434,
+      "path": "crates/binance/src/error.rs",
+      "accessCount": 11,
+      "lastAccessed": 1776373197789,
       "type": "file"
     },
     {
@@ -180,6 +180,12 @@
       "type": "file"
     },
     {
+      "path": "crates/risk/src/lib.rs",
+      "accessCount": 5,
+      "lastAccessed": 1776563417679,
+      "type": "file"
+    },
+    {
       "path": "crates/binance/src/decode.rs",
       "accessCount": 4,
       "lastAccessed": 1776372764658,
@@ -219,12 +225,6 @@
       "path": "crates/binance/src/book.rs",
       "accessCount": 3,
       "lastAccessed": 1776372780731,
-      "type": "file"
-    },
-    {
-      "path": "crates/risk/src/lib.rs",
-      "accessCount": 3,
-      "lastAccessed": 1776539479853,
       "type": "file"
     },
     {

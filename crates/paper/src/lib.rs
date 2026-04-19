@@ -88,6 +88,7 @@ impl PaperExecutor {
                 price: lvl.price,
                 qty: Qty(take),
                 ts: now,
+                is_maker: Some(false),
             });
             notional += (lvl.price.0 as i128) * (take as i128);
             filled += take;

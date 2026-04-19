@@ -117,6 +117,7 @@ mod tests {
             price: Price(110),
             qty: Qty(2),
             ts: Timestamp::from_unix_millis(1_700_000_000_000),
+            is_maker: None,
         }
     }
 

@@ -255,6 +255,7 @@ fn decode_execution_report_value(
             price: last_price,
             qty: last_qty,
             ts,
+            is_maker: Some(raw.is_maker),
         });
     }
 
@@ -335,6 +336,10 @@ struct RawExecutionReport {
     cum_quote_qty: String,
     #[serde(rename = "T")]
     transaction_time: i64,
+    /// Binance `m`: true when this trade side was the maker. Only
+    /// present on executionReport frames that carry an actual fill.
+    #[serde(rename = "m", default)]
+    is_maker: bool,
 }
 
 #[cfg(test)]

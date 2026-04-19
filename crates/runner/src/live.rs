@@ -581,6 +581,7 @@ mod tests {
                 price: Price(10_000),
                 qty: Qty(100_000),
                 ts: Timestamp::default(),
+                is_maker: None,
             }],
         };
         inbound.send(report).await.unwrap();

@@ -78,6 +78,13 @@ pub struct Fill {
     pub price: Price,
     pub qty: Qty,
     pub ts: Timestamp,
+    /// Liquidity side of this fill: `Some(true)` if we provided
+    /// liquidity (maker), `Some(false)` if we took it (taker), `None`
+    /// when the source cannot report it. Paper engines currently leave
+    /// this unset; the Binance user-stream fills it from the exchange's
+    /// `m` flag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_maker: Option<bool>,
 }
 
 /// Terminal result of submitting a single order: every fill that

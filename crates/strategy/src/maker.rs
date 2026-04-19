@@ -205,6 +205,7 @@ mod tests {
             price: Price(100),
             qty: Qty(qty),
             ts: Timestamp::default(),
+            is_maker: None,
         }
     }
 
