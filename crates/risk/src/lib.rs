@@ -10,10 +10,12 @@
 #![forbid(unsafe_code)]
 
 pub mod clock_skew_guard;
+pub mod clock_skew_tracker;
 pub mod kill_switch;
 pub mod pnl_guard;
 pub mod staleness_guard;
 pub use clock_skew_guard::{ClockSkewBreach, ClockSkewGuard, ClockSkewGuardConfig};
+pub use clock_skew_tracker::{ClockSkewSnapshot, ClockSkewTracker};
 pub use kill_switch::{KillSwitch, KillSwitchConfig, TripReason};
 pub use pnl_guard::{GuardBreach, PnlGuard, PnlGuardConfig};
 pub use staleness_guard::{StalenessBreach, StalenessGuard, StalenessGuardConfig};
