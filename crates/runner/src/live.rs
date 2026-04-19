@@ -313,6 +313,17 @@ impl<E: OrderEngine> LiveRunner<E> {
         let position = self.accountant.position_total();
         if let Some(m) = self.metrics.as_ref() {
             m.observe_pnl(realized_net, unrealized, position, mark);
+            for (sym, book) in self.accountant.iter() {
+                let unr = mark.map_or(0, |p| self.accountant.unrealized(sym, p));
+                m.observe_pnl_symbol(
+                    sym,
+                    book.position,
+                    book.realized - book.fees,
+                    unr,
+                    book.fees,
+                    mark,
+                );
+            }
         }
         let Some(guard) = self.pnl_guard.as_mut() else {
             return;

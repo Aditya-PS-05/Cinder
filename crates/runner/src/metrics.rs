@@ -12,17 +12,18 @@
 //! is intended for Prometheus-style scrape polling, not general
 //! traffic.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use ts_core::{MarketEvent, Price};
+use ts_core::{MarketEvent, Price, Symbol};
 use ts_replay::ReplaySummary;
 use ts_risk::KillSwitch;
 
@@ -83,6 +84,33 @@ impl LatencyHistogram {
     }
 }
 
+/// Immutable snapshot of one symbol's gauges, assembled by the encoder
+/// so Prometheus rendering does not hold the symbol-map mutex.
+#[derive(Clone, Debug, Default)]
+struct SymbolSnapshot {
+    position: i64,
+    realized_pnl: i64,
+    unrealized_pnl: i64,
+    total_pnl: i64,
+    fees: i64,
+    mark_price: i64,
+    mark_known: bool,
+}
+
+/// Per-symbol PnL/position snapshot published alongside the global
+/// scalar gauges. Stored behind an `Arc` so the encoder can clone
+/// references out while the runner keeps writing.
+#[derive(Debug, Default)]
+struct SymbolGauges {
+    position: AtomicI64,
+    realized_pnl: AtomicI64,
+    unrealized_pnl: AtomicI64,
+    total_pnl: AtomicI64,
+    fees: AtomicI64,
+    mark_price: AtomicI64,
+    mark_known: AtomicU64,
+}
+
 /// Lock-free view of the runner's cumulative state.
 #[derive(Debug, Default)]
 pub struct RunnerMetrics {
@@ -109,6 +137,12 @@ pub struct RunnerMetrics {
     /// WS → decoder → runner leg; ignores events the venue did not
     /// stamp (both timestamps must be set for the sample to count).
     ingest_latency_nanos: LatencyHistogram,
+
+    /// Per-symbol PnL/position gauges. Lazily populated on first
+    /// observation per symbol; the `Mutex` guards only the map
+    /// (insertion + Arc clone). Reads and writes against the inner
+    /// atomics stay lock-free.
+    by_symbol: Mutex<HashMap<Symbol, Arc<SymbolGauges>>>,
 }
 
 impl RunnerMetrics {
@@ -211,6 +245,81 @@ impl RunnerMetrics {
                 self.mark_known.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Publish a single symbol's PnL snapshot into the labeled gauges.
+    /// `realized_net` is realized minus quote-denominated fees at the
+    /// `price_scale * qty_scale` mantissa; `unrealized` is marked to
+    /// `mark` when `Some`; `fees` is the running quote-denominated
+    /// commission total. Paired with [`Self::observe_pnl`] — the
+    /// unlabeled scalar gauges remain the aggregate view, and these
+    /// labeled gauges expose the breakdown.
+    pub fn observe_pnl_symbol(
+        &self,
+        symbol: &Symbol,
+        position: i64,
+        realized_net: i128,
+        unrealized: i128,
+        fees: i128,
+        mark: Option<Price>,
+    ) {
+        let g = self.gauges_for(symbol);
+        g.position.store(position, Ordering::Relaxed);
+        g.realized_pnl
+            .store(saturating_i128_to_i64(realized_net), Ordering::Relaxed);
+        g.unrealized_pnl
+            .store(saturating_i128_to_i64(unrealized), Ordering::Relaxed);
+        g.total_pnl.store(
+            saturating_i128_to_i64(realized_net.saturating_add(unrealized)),
+            Ordering::Relaxed,
+        );
+        g.fees
+            .store(saturating_i128_to_i64(fees), Ordering::Relaxed);
+        match mark {
+            Some(p) => {
+                g.mark_price.store(p.0, Ordering::Relaxed);
+                g.mark_known.store(1, Ordering::Relaxed);
+            }
+            None => {
+                g.mark_known.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn gauges_for(&self, symbol: &Symbol) -> Arc<SymbolGauges> {
+        let mut map = self.by_symbol.lock().expect("metrics symbol-map poisoned");
+        if let Some(g) = map.get(symbol) {
+            return Arc::clone(g);
+        }
+        let g = Arc::new(SymbolGauges::default());
+        map.insert(symbol.clone(), Arc::clone(&g));
+        g
+    }
+
+    /// Snapshot every per-symbol gauge into an owned vector. Copies
+    /// atomic reads eagerly so the rendering path doesn't hold the
+    /// symbol-map lock across encode-time allocations.
+    fn symbol_snapshot(&self) -> Vec<(String, SymbolSnapshot)> {
+        let map = self.by_symbol.lock().expect("metrics symbol-map poisoned");
+        let mut out: Vec<_> = map
+            .iter()
+            .map(|(sym, g)| {
+                (
+                    sym.as_str().to_string(),
+                    SymbolSnapshot {
+                        position: g.position.load(Ordering::Relaxed),
+                        realized_pnl: g.realized_pnl.load(Ordering::Relaxed),
+                        unrealized_pnl: g.unrealized_pnl.load(Ordering::Relaxed),
+                        total_pnl: g.total_pnl.load(Ordering::Relaxed),
+                        fees: g.fees.load(Ordering::Relaxed),
+                        mark_price: g.mark_price.load(Ordering::Relaxed),
+                        mark_known: g.mark_known.load(Ordering::Relaxed) != 0,
+                    },
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Observe counters from a [`LiveSummary`]. Position, PnL, and mark
@@ -335,7 +444,70 @@ impl RunnerMetrics {
             "ts_ingest_latency_nanos",
             "Exchange→local delivery latency per market event (nanoseconds).",
         );
+        encode_symbol_gauges(&mut out, &self.symbol_snapshot());
         out
+    }
+}
+
+fn encode_symbol_gauges(out: &mut String, snapshots: &[(String, SymbolSnapshot)]) {
+    if snapshots.is_empty() {
+        return;
+    }
+    labeled_gauge_block(
+        out,
+        "ts_symbol_position",
+        "Signed position per symbol (qty-scale mantissa).",
+        snapshots.iter().map(|(s, v)| (s.as_str(), v.position)),
+    );
+    labeled_gauge_block(
+        out,
+        "ts_symbol_realized_pnl",
+        "Per-symbol realized PnL net of quote-denominated commissions.",
+        snapshots.iter().map(|(s, v)| (s.as_str(), v.realized_pnl)),
+    );
+    labeled_gauge_block(
+        out,
+        "ts_symbol_unrealized_pnl",
+        "Per-symbol unrealized PnL marked to the latest mid.",
+        snapshots
+            .iter()
+            .map(|(s, v)| (s.as_str(), v.unrealized_pnl)),
+    );
+    labeled_gauge_block(
+        out,
+        "ts_symbol_total_pnl",
+        "Per-symbol realized-net + unrealized PnL.",
+        snapshots.iter().map(|(s, v)| (s.as_str(), v.total_pnl)),
+    );
+    labeled_gauge_block(
+        out,
+        "ts_symbol_fees",
+        "Cumulative quote-denominated commissions per symbol.",
+        snapshots.iter().map(|(s, v)| (s.as_str(), v.fees)),
+    );
+    let marks: Vec<(&str, i64)> = snapshots
+        .iter()
+        .filter(|(_, v)| v.mark_known)
+        .map(|(s, v)| (s.as_str(), v.mark_price))
+        .collect();
+    if !marks.is_empty() {
+        labeled_gauge_block(
+            out,
+            "ts_symbol_mark_price",
+            "Last mark price used for per-symbol PnL (price-scale mantissa).",
+            marks.iter().copied(),
+        );
+    }
+}
+
+fn labeled_gauge_block<'a, I>(out: &mut String, name: &str, help: &str, rows: I)
+where
+    I: IntoIterator<Item = (&'a str, i64)>,
+{
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    for (label, value) in rows {
+        let _ = writeln!(out, "{name}{{symbol=\"{label}\"}} {value}");
     }
 }
 
@@ -561,10 +733,7 @@ mod tests {
             "unrealized, got:\n{body}"
         );
         assert!(body.contains("ts_total_pnl 155"), "total, got:\n{body}");
-        assert!(
-            body.contains("ts_mark_price 12345"),
-            "mark, got:\n{body}"
-        );
+        assert!(body.contains("ts_mark_price 12345"), "mark, got:\n{body}");
     }
 
     #[test]
@@ -584,6 +753,65 @@ mod tests {
         assert!(
             !body.contains("ts_mark_price"),
             "mark must be hidden when None, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn observe_pnl_symbol_emits_labeled_gauges() {
+        use ts_core::Symbol;
+        let m = RunnerMetrics::new();
+        let btc = Symbol::from_static("BTCUSDT");
+        let eth = Symbol::from_static("ETHUSDT");
+        m.observe_pnl_symbol(&btc, 5, 200, 30, 10, Some(Price(12_000)));
+        m.observe_pnl_symbol(&eth, -2, -50, 15, 3, None);
+        let body = m.encode_prometheus();
+
+        for needle in [
+            "# TYPE ts_symbol_position gauge",
+            "ts_symbol_position{symbol=\"BTCUSDT\"} 5",
+            "ts_symbol_position{symbol=\"ETHUSDT\"} -2",
+            "ts_symbol_realized_pnl{symbol=\"BTCUSDT\"} 200",
+            "ts_symbol_realized_pnl{symbol=\"ETHUSDT\"} -50",
+            "ts_symbol_unrealized_pnl{symbol=\"BTCUSDT\"} 30",
+            "ts_symbol_total_pnl{symbol=\"BTCUSDT\"} 230",
+            "ts_symbol_fees{symbol=\"BTCUSDT\"} 10",
+            "ts_symbol_mark_price{symbol=\"BTCUSDT\"} 12000",
+        ] {
+            assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
+        }
+        // ETH has no known mark, so no labeled mark line for it.
+        assert!(
+            !body.contains("ts_symbol_mark_price{symbol=\"ETHUSDT\""),
+            "unknown-mark symbol must not emit a mark gauge, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn observe_pnl_symbol_overwrites_on_repeated_observation() {
+        use ts_core::Symbol;
+        let m = RunnerMetrics::new();
+        let btc = Symbol::from_static("BTCUSDT");
+        m.observe_pnl_symbol(&btc, 5, 100, 10, 0, Some(Price(10_000)));
+        m.observe_pnl_symbol(&btc, -3, -20, 5, 2, None);
+        let body = m.encode_prometheus();
+        assert!(body.contains("ts_symbol_position{symbol=\"BTCUSDT\"} -3"));
+        assert!(body.contains("ts_symbol_realized_pnl{symbol=\"BTCUSDT\"} -20"));
+        assert!(body.contains("ts_symbol_total_pnl{symbol=\"BTCUSDT\"} -15"));
+        // Once mark becomes unknown no labeled mark gauge surfaces for
+        // this symbol, even though a prior observation set one.
+        assert!(
+            !body.contains("ts_symbol_mark_price{symbol=\"BTCUSDT\""),
+            "stale mark must not linger, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn no_per_symbol_block_emitted_when_no_symbols_observed() {
+        let m = RunnerMetrics::new();
+        let body = m.encode_prometheus();
+        assert!(
+            !body.contains("ts_symbol_"),
+            "labeled block must be hidden when empty, got:\n{body}"
         );
     }
 

@@ -83,6 +83,18 @@ impl<S: Strategy> Replay<S> {
         &self.metrics
     }
 
+    /// Whether the underlying [`PaperEngine`] is gating strategy
+    /// actions. See [`PaperEngine::is_paused`].
+    pub fn is_paused(&self) -> bool {
+        self.engine.is_paused()
+    }
+
+    /// Toggle the engine's action gate. Used by runners to honor a
+    /// tripped kill switch without tearing the engine down.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.engine.set_paused(paused);
+    }
+
     /// Feed a single market event through the engine and fold the
     /// resulting step into the accountant and metrics.
     pub fn step(&mut self, event: &MarketEvent) -> Result<EngineStep, BookError> {
@@ -408,6 +420,29 @@ mod tests {
         let second = r.drain_shutdown(Timestamp::default());
         assert!(second.reports.is_empty());
         assert!(second.fills.is_empty());
+    }
+
+    #[test]
+    fn set_paused_propagates_and_gates_strategy_actions() {
+        let mut r = Replay::new(engine());
+        r.set_paused(true);
+        assert!(r.is_paused());
+        // Snapshot would normally trigger the maker to place 2 quotes.
+        let step = r
+            .step(&snapshot(vec![lvl(100, 10)], vec![lvl(110, 10)], 1))
+            .unwrap();
+        assert!(step.reports.is_empty());
+        assert!(step.fills.is_empty());
+        // Counters still advance for the book update.
+        assert_eq!(r.metrics().book_updates, 1);
+        assert_eq!(r.metrics().orders_submitted, 0);
+
+        r.set_paused(false);
+        assert!(!r.is_paused());
+        let step = r
+            .step(&snapshot(vec![lvl(101, 10)], vec![lvl(109, 10)], 2))
+            .unwrap();
+        assert!(!step.reports.is_empty());
     }
 
     #[test]

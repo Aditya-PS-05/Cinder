@@ -67,6 +67,14 @@ pub struct PaperEngine<S: Strategy> {
     exec: PaperExecutor,
     strategy: S,
     live_orders: HashMap<ClientOrderId, NewOrder>,
+    /// When `true`, [`Self::apply_event`] still applies book updates but
+    /// skips the strategy tick entirely. Skipping — rather than calling
+    /// `on_book_update` and dropping the returned actions — keeps the
+    /// strategy's quote ledger from remembering ghost placements that
+    /// would then emit spurious cancels on the first tick after unpause.
+    /// [`Self::drain_shutdown`] is intentionally exempt so a halted
+    /// runner can still cancel open quotes during shutdown.
+    paused: bool,
 }
 
 impl<S: Strategy> PaperEngine<S> {
@@ -78,6 +86,7 @@ impl<S: Strategy> PaperEngine<S> {
             exec: PaperExecutor::new(),
             strategy,
             live_orders: HashMap::new(),
+            paused: false,
         }
     }
 
@@ -95,6 +104,16 @@ impl<S: Strategy> PaperEngine<S> {
     }
     pub fn live_orders(&self) -> &HashMap<ClientOrderId, NewOrder> {
         &self.live_orders
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Toggle the action gate. Idempotent — repeated sets of the same
+    /// value are no-ops.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
     }
 
     /// Apply a single market event, tick the strategy on book-moving
@@ -123,6 +142,14 @@ impl<S: Strategy> PaperEngine<S> {
             return Ok(EngineStep::default());
         }
 
+        if self.paused {
+            // Skip the strategy tick wholesale while paused. We still
+            // applied the book update above, so the book stays fresh,
+            // but we do not give the strategy a chance to track quotes
+            // it would not actually place. `drain_shutdown` remains the
+            // only path that can run strategy actions in this state.
+            return Ok(EngineStep::default());
+        }
         let actions = self.strategy.on_book_update(event.local_ts, &self.book);
         Ok(self.process_actions(actions, event.local_ts))
     }
@@ -468,6 +495,50 @@ mod tests {
         let report = e.cancel(&ClientOrderId::new("no-such-order")).unwrap();
         assert_eq!(report.status, OrderStatus::Rejected);
         assert_eq!(e.risk().open_orders(), 0);
+    }
+
+    #[test]
+    fn paused_engine_drops_strategy_actions_on_book_update() {
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), maker());
+        e.set_paused(true);
+        assert!(e.is_paused());
+
+        let step = e
+            .apply_event(&snapshot_event(vec![lvl(100, 5)], vec![lvl(110, 5)], 1))
+            .unwrap();
+
+        // Maker would normally place two quotes — gated to nothing.
+        assert!(step.reports.is_empty());
+        assert!(step.fills.is_empty());
+        assert!(e.live_orders().is_empty());
+        assert_eq!(e.risk().open_orders(), 0);
+
+        // Unpause and the next book update places quotes as usual.
+        e.set_paused(false);
+        let step = e
+            .apply_event(&snapshot_event(vec![lvl(101, 5)], vec![lvl(109, 5)], 2))
+            .unwrap();
+        assert_eq!(step.reports.len(), 2);
+        assert_eq!(e.live_orders().len(), 2);
+    }
+
+    #[test]
+    fn drain_shutdown_emits_cancels_even_when_paused() {
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), maker());
+        // Place two quotes via a normal tick.
+        e.apply_event(&snapshot_event(vec![lvl(100, 5)], vec![lvl(110, 5)], 1))
+            .unwrap();
+        assert_eq!(e.live_orders().len(), 2);
+
+        // Pausing must NOT muzzle the shutdown sweep — outstanding
+        // orders need to be cancelled even after a kill switch trip.
+        e.set_paused(true);
+        let step = e.drain_shutdown(Timestamp::default());
+        assert_eq!(step.reports.len(), 2);
+        for r in &step.reports {
+            assert_eq!(r.status, OrderStatus::Canceled);
+        }
+        assert!(e.live_orders().is_empty());
     }
 
     #[test]

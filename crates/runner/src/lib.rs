@@ -23,14 +23,15 @@ pub mod paper_cfg;
 pub mod tape;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::{debug, warn};
 
-use ts_core::{bus::Subscription, MarketEvent, Timestamp};
+use ts_core::{bus::Subscription, MarketEvent, Price, Timestamp};
 use ts_replay::{Replay, ReplaySummary};
+use ts_risk::{KillSwitch, PnlGuard};
 use ts_strategy::Strategy;
 
 use crate::audit::AuditEvent;
@@ -44,6 +45,8 @@ pub struct EngineRunner<S: Strategy> {
     summary_interval: Duration,
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
     metrics: Option<Arc<RunnerMetrics>>,
+    kill_switch: Option<Arc<KillSwitch>>,
+    pnl_guard: Option<PnlGuard>,
 }
 
 /// Remote control for an [`EngineRunner`]. Dropping the handle does not
@@ -102,6 +105,8 @@ impl<S: Strategy> EngineRunner<S> {
             summary_interval: interval,
             audit_tx: None,
             metrics: None,
+            kill_switch: None,
+            pnl_guard: None,
         };
         (runner, handle)
     }
@@ -129,9 +134,34 @@ impl<S: Strategy> EngineRunner<S> {
         self
     }
 
+    /// Attach a process-wide [`KillSwitch`]. While tripped, every
+    /// strategy-driven place/cancel emitted on a book update is dropped
+    /// at the engine boundary; the shutdown sweep still runs cancels
+    /// for any orders the strategy thinks it has open.
+    pub fn with_kill_switch(mut self, ks: Arc<KillSwitch>) -> Self {
+        self.kill_switch = Some(ks);
+        self
+    }
+
+    /// Attach a [`PnlGuard`]. The runner re-evaluates the guard after
+    /// each event (and on every summary tick) using the replay's
+    /// realized-net + unrealized totals; a breach trips the attached
+    /// [`KillSwitch`]. Without a kill switch the guard observes only
+    /// — there is no downstream to signal.
+    pub fn with_pnl_guard(mut self, guard: PnlGuard) -> Self {
+        self.pnl_guard = Some(guard);
+        self
+    }
+
     /// Drive the replay loop until the event channel closes or the
     /// handle signals shutdown. Returns the final summary.
     pub async fn run(mut self) -> ReplaySummary {
+        // Seed the PnL guard before any market events so its daily
+        // baseline is pinned to the start-of-session realized total
+        // (typically zero) instead of whatever the first post-fill
+        // snapshot happens to be.
+        self.evaluate_pnl_guard();
+
         let mut interval_ticker = if self.summary_interval.is_zero() {
             None
         } else {
@@ -163,6 +193,15 @@ impl<S: Strategy> EngineRunner<S> {
                     if let Some(m) = self.metrics.as_ref() {
                         m.observe_event(&event);
                     }
+                    // Honor the kill switch by gating the engine's
+                    // action processing for this step. Toggle-as-we-go
+                    // so an out-of-band reset rearms quoting on the
+                    // very next event without a process restart.
+                    let halted = self
+                        .kill_switch
+                        .as_ref()
+                        .is_some_and(|ks| ks.tripped());
+                    self.replay.set_paused(halted);
                     match self.replay.step(&event) {
                         Ok(step) => {
                             if let Some(tx) = self.audit_tx.as_ref() {
@@ -191,6 +230,7 @@ impl<S: Strategy> EngineRunner<S> {
                     if let Some(m) = self.metrics.as_ref() {
                         m.observe(&self.replay.summary());
                     }
+                    self.evaluate_pnl_guard();
                 }
                 _ = async {
                     match interval_ticker.as_mut() {
@@ -198,14 +238,13 @@ impl<S: Strategy> EngineRunner<S> {
                         None => std::future::pending::<()>().await,
                     }
                 } => {
+                    let snap = self.replay.summary();
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.observe(&snap);
+                    }
+                    self.evaluate_pnl_guard();
                     if let Some(tx) = self.summary_tx.as_ref() {
-                        let snap = self.replay.summary();
-                        if let Some(m) = self.metrics.as_ref() {
-                            m.observe(&snap);
-                        }
                         let _ = tx.send(snap);
-                    } else if let Some(m) = self.metrics.as_ref() {
-                        m.observe(&self.replay.summary());
                     }
                 }
             }
@@ -213,6 +252,9 @@ impl<S: Strategy> EngineRunner<S> {
         // Clean up any open quotes the strategy still holds. For the
         // paper engine this is bookkeeping; on a live venue it matters
         // — the process is leaving, the quotes should leave with it.
+        // drain_shutdown bypasses the pause gate so cancels still flow
+        // even after a kill-switch trip.
+        self.replay.set_paused(false);
         let cleanup = self.replay.drain_shutdown(last_ts);
         if let Some(tx) = self.audit_tx.as_ref() {
             for r in &cleanup.reports {
@@ -228,6 +270,55 @@ impl<S: Strategy> EngineRunner<S> {
             m.observe(&final_summary);
         }
         final_summary
+    }
+
+    /// Compute the PnL snapshot (realized net, unrealized, position,
+    /// mark) from the replay's accountant and publish it to
+    /// `RunnerMetrics`; then re-evaluate the configured [`PnlGuard`]
+    /// and trip the kill switch on a breach. Guard evaluation is a
+    /// no-op when the guard or kill switch is unattached, when the
+    /// switch is already tripped, or when no threshold is crossed —
+    /// metrics still publish on every call so dashboards stay current
+    /// even before any limit is configured.
+    fn evaluate_pnl_guard(&mut self) {
+        let mark = self.replay.engine().book().mid().map(Price);
+        let accountant = self.replay.accountant();
+        let realized_net = accountant.realized_net_total();
+        let unrealized = accountant.unrealized_total(|_| mark);
+        let position = accountant.position_total();
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_pnl(realized_net, unrealized, position, mark);
+            for (sym, book) in accountant.iter() {
+                let unr = mark.map_or(0, |p| accountant.unrealized(sym, p));
+                m.observe_pnl_symbol(
+                    sym,
+                    book.position,
+                    book.realized - book.fees,
+                    unr,
+                    book.fees,
+                    mark,
+                );
+            }
+        }
+        let Some(guard) = self.pnl_guard.as_mut() else {
+            return;
+        };
+        let Some(ks) = self.kill_switch.as_ref() else {
+            return;
+        };
+        if ks.tripped() {
+            return;
+        }
+        if let Some(breach) = guard.observe(Instant::now(), realized_net, unrealized) {
+            warn!(
+                ?breach,
+                "engine-runner: pnl guard breach; tripping kill switch"
+            );
+            ks.trip(breach.to_trip_reason());
+            if let Some(m) = self.metrics.as_ref() {
+                m.observe_kill_switch(ks);
+            }
+        }
     }
 }
 

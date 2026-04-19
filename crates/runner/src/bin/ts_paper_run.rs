@@ -30,11 +30,13 @@ use ts_config::Env;
 use ts_core::{bus::Bus, InstrumentSpec, MarketEvent, Qty, Symbol, Venue};
 use ts_oms::{EngineConfig, PaperEngine, RiskConfig};
 use ts_replay::{Replay, ReplaySummary};
+use ts_risk::{KillSwitch, KillSwitchConfig, PnlGuard, PnlGuardConfig};
 use ts_runner::{
     audit::{spawn_audit_writer, AuditWriter},
     bridge_bus,
+    kill_switch_watch::spawn_halt_file_watcher,
     metrics::{spawn_metrics_server, RunnerMetrics},
-    paper_cfg::{AuditCfg, MetricsCfg, PaperCfg},
+    paper_cfg::{AuditCfg, KillSwitchCfg, MetricsCfg, PaperCfg, RiskCfg},
     EngineRunner,
 };
 use ts_strategy::{InventorySkewMaker, MakerConfig};
@@ -108,6 +110,21 @@ struct Cli {
     /// when set. Omit to disable.
     #[arg(long)]
     metrics_addr: Option<String>,
+
+    /// Filesystem path whose appearance trips the kill switch
+    /// (`touch <path>` to halt trading). Implies kill-switch attached.
+    #[arg(long)]
+    halt_file: Option<PathBuf>,
+
+    /// Max drawdown (realized-net + unrealized, `price_scale * qty_scale`
+    /// mantissa) before the PnL guard trips the kill switch.
+    #[arg(long)]
+    max_drawdown: Option<i64>,
+
+    /// Max realized-net daily loss (same mantissa) before the PnL guard
+    /// trips the kill switch.
+    #[arg(long)]
+    max_daily_loss: Option<i64>,
 }
 
 #[tokio::main]
@@ -174,6 +191,21 @@ fn resolve_config(cli: &Cli) -> Result<PaperCfg> {
     if let Some(listen) = cli.metrics_addr.clone() {
         cfg.metrics = Some(MetricsCfg { listen });
     }
+    if let Some(path) = cli.halt_file.clone() {
+        let mut ks = cfg.kill_switch.clone().unwrap_or_default();
+        ks.halt_file = Some(path);
+        cfg.kill_switch = Some(ks);
+    }
+    if cli.max_drawdown.is_some() || cli.max_daily_loss.is_some() {
+        let mut r = cfg.risk.clone().unwrap_or_default();
+        if let Some(v) = cli.max_drawdown {
+            r.max_drawdown = Some(v);
+        }
+        if let Some(v) = cli.max_daily_loss {
+            r.max_daily_loss = Some(v);
+        }
+        cfg.risk = Some(r);
+    }
 
     Ok(cfg)
 }
@@ -228,6 +260,19 @@ async fn run(cfg: PaperCfg) -> Result<()> {
     let summary_interval = Duration::from_secs(cfg.runner.summary_secs);
     let (mut runner, handle) = EngineRunner::with_summary_tap(replay, rx, summary_interval, 8);
 
+    let (kill_switch, halt_watcher) = wire_kill_switch(cfg.kill_switch.as_ref());
+    if let Some(ks) = kill_switch.as_ref() {
+        runner = runner.with_kill_switch(Arc::clone(ks));
+    }
+    if let Some(guard) = build_pnl_guard(cfg.risk.as_ref()) {
+        if kill_switch.is_none() {
+            tracing::warn!(
+                "pnl guard configured without kill_switch; guard will observe but cannot trip"
+            );
+        }
+        runner = runner.with_pnl_guard(guard);
+    }
+
     let metrics_server = if let Some(mcfg) = cfg.metrics.as_ref() {
         let addr: std::net::SocketAddr = mcfg
             .listen
@@ -238,6 +283,9 @@ async fn run(cfg: PaperCfg) -> Result<()> {
             .with_context(|| format!("bind metrics listener on {addr}"))?;
         let actual = listener.local_addr().context("metrics local_addr")?;
         let metrics = RunnerMetrics::new();
+        if let Some(ks) = kill_switch.as_ref() {
+            metrics.observe_kill_switch(ks);
+        }
         runner = runner.with_metrics(Arc::clone(&metrics));
         tracing::info!(addr = %actual, "metrics endpoint /metrics ready");
         Some(spawn_metrics_server(listener, metrics))
@@ -280,6 +328,9 @@ async fn run(cfg: PaperCfg) -> Result<()> {
 
     // Stop the WS reconnect loop; close the bus so the bridge drains.
     client_task.abort();
+    if let Some(w) = halt_watcher.as_ref() {
+        w.abort();
+    }
     bus.close();
     let _ = bridge.await;
     handle.shutdown();
@@ -302,6 +353,46 @@ async fn run(cfg: PaperCfg) -> Result<()> {
     }
     log_summary(&symbol_str, "final", &summary);
     Ok(())
+}
+
+/// Build a [`PnlGuard`] from `cfg`. Returns `None` when no risk section
+/// is configured or both thresholds are unset — a no-op guard would
+/// silently mask an obvious misconfiguration.
+fn build_pnl_guard(cfg: Option<&RiskCfg>) -> Option<PnlGuard> {
+    let cfg = cfg?;
+    if cfg.max_drawdown.is_none() && cfg.max_daily_loss.is_none() {
+        return None;
+    }
+    Some(PnlGuard::new(PnlGuardConfig {
+        max_drawdown: cfg.max_drawdown.map(i128::from),
+        max_daily_loss: cfg.max_daily_loss.map(i128::from),
+        day_length: Duration::from_secs(cfg.day_length_secs),
+    }))
+}
+
+/// Build the optional shared [`KillSwitch`] from config and, if a
+/// `halt_file` path is set, spawn the filesystem watcher that trips it
+/// when the file appears. Returns the switch and the watcher's join
+/// handle so the caller can abort during shutdown. Missing
+/// `kill_switch` section ⇒ no switch attached.
+fn wire_kill_switch(
+    cfg: Option<&KillSwitchCfg>,
+) -> (Option<Arc<KillSwitch>>, Option<tokio::task::JoinHandle<()>>) {
+    let Some(cfg) = cfg else {
+        return (None, None);
+    };
+    let ks = Arc::new(KillSwitch::new(KillSwitchConfig {
+        reject_threshold: cfg.reject_threshold,
+        window: Duration::from_millis(cfg.window_ms),
+    }));
+    let watcher = cfg.halt_file.as_ref().map(|path| {
+        spawn_halt_file_watcher(
+            Arc::clone(&ks),
+            path.clone(),
+            Duration::from_millis(cfg.poll_ms),
+        )
+    });
+    (Some(ks), watcher)
 }
 
 fn log_summary(symbol: &str, tag: &str, s: &ReplaySummary) {

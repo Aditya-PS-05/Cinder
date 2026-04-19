@@ -69,6 +69,13 @@ impl Accountant {
         self.books.get(symbol)
     }
 
+    /// Iterate over every `(symbol, book)` pair seen so far. Exposed so
+    /// runners can publish per-symbol PnL/position gauges without a
+    /// parallel bookkeeping structure.
+    pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &SymbolBook)> {
+        self.books.iter()
+    }
+
     pub fn position(&self, symbol: &Symbol) -> i64 {
         self.books.get(symbol).map_or(0, |b| b.position)
     }

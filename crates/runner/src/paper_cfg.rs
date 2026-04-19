@@ -24,6 +24,10 @@ pub struct PaperCfg {
     pub audit: Option<AuditCfg>,
     #[serde(default)]
     pub metrics: Option<MetricsCfg>,
+    #[serde(default)]
+    pub kill_switch: Option<KillSwitchCfg>,
+    #[serde(default)]
+    pub risk: Option<RiskCfg>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -77,6 +81,72 @@ pub struct AuditCfg {
 pub struct MetricsCfg {
     /// "host:port" address the scrape endpoint listens on.
     pub listen: String,
+}
+
+/// Optional PnL-guard wiring. A missing section leaves the runner
+/// without a guard; a present section with both limits `None` is a
+/// no-op (guard constructed but nothing to trip on). Mantissas match
+/// [`ts_pnl::Accountant`]: `price_scale * qty_scale`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RiskCfg {
+    /// Drop from peak equity (realized-net + unrealized) that trips
+    /// [`ts_risk::TripReason::MaxDrawdown`].
+    #[serde(default)]
+    pub max_drawdown: Option<i64>,
+    /// Realized-net loss since day-start that trips
+    /// [`ts_risk::TripReason::DailyLoss`].
+    #[serde(default)]
+    pub max_daily_loss: Option<i64>,
+    /// Sliding-window length for the daily baseline, in seconds.
+    /// Defaults to 24 h.
+    #[serde(default = "default_day_length_secs")]
+    pub day_length_secs: u64,
+}
+
+fn default_day_length_secs() -> u64 {
+    24 * 60 * 60
+}
+
+/// Optional kill-switch wiring. A missing section leaves the runner
+/// with no switch attached; an empty section enables defaults
+/// (reject-rate trigger only, no halt-file watcher).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KillSwitchCfg {
+    /// Filesystem path polled by the halt-file watcher. Creating the
+    /// file (e.g. `touch /tmp/ts-halt`) trips the switch. Omit to leave
+    /// manual halt unmonitored.
+    #[serde(default)]
+    pub halt_file: Option<PathBuf>,
+    /// Rejects inside `window_ms` that force the switch to trip.
+    #[serde(default = "default_reject_threshold")]
+    pub reject_threshold: u32,
+    /// Sliding reject-window horizon, in milliseconds.
+    #[serde(default = "default_window_ms")]
+    pub window_ms: u64,
+    /// Halt-file polling cadence, in milliseconds.
+    #[serde(default = "default_poll_ms")]
+    pub poll_ms: u64,
+}
+
+impl Default for KillSwitchCfg {
+    fn default() -> Self {
+        Self {
+            halt_file: None,
+            reject_threshold: default_reject_threshold(),
+            window_ms: default_window_ms(),
+            poll_ms: default_poll_ms(),
+        }
+    }
+}
+
+fn default_reject_threshold() -> u32 {
+    10
+}
+fn default_window_ms() -> u64 {
+    5_000
+}
+fn default_poll_ms() -> u64 {
+    250
 }
 
 impl Default for MarketCfg {
