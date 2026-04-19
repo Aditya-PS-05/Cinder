@@ -1,41 +1,53 @@
 # Cinder build notes
 
 ## Current phase (2026-04-19)
-Max drawdown + daily loss guard — Section 7 P0 (#153).
+PnL-guard runner wiring — Section 7 P0 (#152).
 
 ## What shipped
-- `ts_risk::pnl_guard::PnlGuard` — stateful i128 component with
-  optional `max_drawdown` + `max_daily_loss` thresholds.
-- `GuardBreach` enum with `MaxDrawdown { peak, equity, drawdown, limit }`
-  and `DailyLoss { day_start_realized, realized, loss, limit }`.
-- New `TripReason::MaxDrawdown` (=4) and `TripReason::DailyLoss` (=5),
-  wired into `runner::metrics::observe_kill_switch`.
-- `GuardBreach::to_trip_reason` maps breach → TripReason so runner
-  wiring is a one-liner.
+- `LiveRunner` now owns a `ts_pnl::Accountant` (fills fold on every
+  `observe_fill`) and an optional `PnlGuard`. `drain_reconcile` ends
+  with `evaluate_pnl_guard()`; `run()` seeds the guard once at startup
+  so the daily baseline is pinned to zero before any fills land.
+- Builder surface: `LiveRunnerBuilder::pnl_guard(PnlGuard)`. On breach,
+  the runner calls `kill_switch.trip(breach.to_trip_reason())` and
+  re-observes the switch on the metrics snapshot.
+- `LiveCfg.risk` + `RiskCfg { max_drawdown, max_daily_loss,
+  day_length_secs }` with `serde(default)` on both limits.
+- `ts-live-run` gains `--max-drawdown` / `--max-daily-loss` CLI flags
+  plus a `build_pnl_guard` helper. Guard attaches only when at least
+  one threshold is set; missing `KillSwitch` emits a warn log (guard
+  can observe but not trip).
+- Two new integration tests: a realized loss of 200 trips the switch
+  on `DailyLoss`; a loss of 20 under a 50-limit stays armed.
 
 ## Design calls
-- Daily baseline is a sliding Instant-based window; production UTC
-  midnight alignment is a runner concern, not this crate's. Pass
-  `Duration::from_secs(86_400)` and seed on the first observe.
-- Daily loss is realized-net only — unrealized drops shouldn't age
-  the baseline, since realized is what operators must pay.
-- Drawdown is all-time, does NOT reset on day rollover.
-- One breach per call: if both limits would fire, `DailyLoss`
-  reports first (louder alarm), `MaxDrawdown` surfaces on the
-  next tick. Already-tripped limits are silent until `reset()`.
+- Guard re-evaluates at end of `drain_reconcile`, not per-fill. One
+  call site per tick; fills inside a tick aggregate, then the guard
+  sees the post-batch state. Mark-driven drawdown is caught on the
+  next reconcile even without new fills.
+- Startup seed is load-bearing: without it, a bursty first batch of
+  fills would set the baseline to the already-lossy state and the
+  loss would be invisible.
+- `evaluate_pnl_guard` passes `self.book.mid()` as the mark for every
+  symbol the accountant tracks. Correct today because `LiveRunner`
+  is single-symbol; if we ever multiplex more symbols through one
+  runner this closure needs a per-symbol book lookup.
+- RiskCfg uses `Option<i64>` fields (YAML friendliness). The bin maps
+  to `i128` before handing to `PnlGuardConfig`.
 
 ## Follow-ups
-- Wire `PnlGuard` into `ts-runner`:
-  * Feed an `Accountant` from the audit tap so realized-net/unrealized
-    totals are live. Needs a mark source (best bid/ask) — maker strategy
-    already has one.
-  * On `observe()` return `Some(breach)`, call `kill_switch.trip(breach.to_trip_reason())`.
-  * Plumb thresholds into `paper_cfg.rs` / `live_cfg.rs` as optional
-    YAML fields (`risk.max_drawdown`, `risk.max_daily_loss`, `risk.day_length_secs`).
-- "Auto-flatten" today = "kill switch trips, shutdown sweep cancels
-  opens, strategy drains quotes". True auto-flatten (submit closing
-  market orders) needs a position-reversal helper — park until we
-  have the SOR scaffolding in place.
-- Cross-asset commission accounting (from last phase) still open; the
-  guard will under-count daily loss whenever BNB-discounted fees
-  are material.
+- Paper-runner (`EngineRunner`) wiring: `ReplaySummary` already has
+  realized/unrealized, so the guard can observe from the periodic
+  summary tap without a separate accountant. Deferred — paper is a
+  lower-risk path and the shape differs from live.
+- True auto-flatten (submit a closing market/aggressive-limit on
+  breach) still needs a position-reversal helper. Park until SOR
+  scaffolding exists.
+- Tripped-switch semantics today drop ALL strategy actions including
+  Cancels (`live.rs` `handle_market_event`). That leaves open orders
+  alive until the runner exits and the shutdown sweep runs. Consider
+  gating only `Place` on trip, letting `Cancel` through, once there's
+  a clean way to distinguish intent.
+- Cross-asset commission accounting (prior phase) still open; the
+  guard under-counts daily loss whenever BNB-discounted fees are
+  material.

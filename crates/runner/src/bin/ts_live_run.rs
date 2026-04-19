@@ -29,13 +29,13 @@ use ts_binance::{
 };
 use ts_config::Env;
 use ts_core::{bus::Bus, InstrumentSpec, MarketEvent, Qty, Symbol, Venue};
-use ts_risk::{KillSwitch, KillSwitchConfig};
+use ts_risk::{KillSwitch, KillSwitchConfig, PnlGuard, PnlGuardConfig};
 use ts_runner::{
     audit::{spawn_audit_writer, AuditWriter},
     bridge_bus,
     kill_switch_watch::spawn_halt_file_watcher,
     live::{LiveRunner, LiveSummary},
-    live_cfg::{KillSwitchCfg, LiveCfg},
+    live_cfg::{KillSwitchCfg, LiveCfg, RiskCfg},
     metrics::{spawn_metrics_server, RunnerMetrics},
     paper_cfg::{AuditCfg, MetricsCfg},
 };
@@ -104,6 +104,16 @@ struct Cli {
     /// (`touch <path>` to halt trading).
     #[arg(long)]
     halt_file: Option<PathBuf>,
+
+    /// Max drawdown (realized-net + unrealized, `price_scale * qty_scale`
+    /// mantissa) before the PnL guard trips the kill switch.
+    #[arg(long)]
+    max_drawdown: Option<i64>,
+
+    /// Max realized-net daily loss (same mantissa) before the PnL guard
+    /// trips the kill switch.
+    #[arg(long)]
+    max_daily_loss: Option<i64>,
 }
 
 #[tokio::main]
@@ -182,6 +192,16 @@ fn resolve_config(cli: &Cli) -> Result<LiveCfg> {
         let mut ks = cfg.kill_switch.clone().unwrap_or_default();
         ks.halt_file = Some(path);
         cfg.kill_switch = Some(ks);
+    }
+    if cli.max_drawdown.is_some() || cli.max_daily_loss.is_some() {
+        let mut r = cfg.risk.clone().unwrap_or_default();
+        if let Some(v) = cli.max_drawdown {
+            r.max_drawdown = Some(v);
+        }
+        if let Some(v) = cli.max_daily_loss {
+            r.max_daily_loss = Some(v);
+        }
+        cfg.risk = Some(r);
     }
 
     Ok(cfg)
@@ -262,6 +282,14 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     let (kill_switch, halt_watcher) = wire_kill_switch(cfg.kill_switch.as_ref());
     if let Some(ks) = kill_switch.as_ref() {
         builder = builder.kill_switch(Arc::clone(ks));
+    }
+    if let Some(guard) = build_pnl_guard(cfg.risk.as_ref()) {
+        if kill_switch.is_none() {
+            tracing::warn!(
+                "pnl guard configured without kill_switch; guard will observe but cannot trip"
+            );
+        }
+        builder = builder.pnl_guard(guard);
     }
 
     let metrics_server = if let Some(mcfg) = cfg.metrics.as_ref() {
@@ -365,6 +393,22 @@ async fn run(cfg: LiveCfg) -> Result<()> {
 /// when the file appears. Returns the switch handle and the watcher's
 /// join-handle (so `main` can abort it during shutdown). A missing
 /// `kill_switch` section leaves the runner without a switch attached.
+/// Build a [`PnlGuard`] from `cfg`. Returns `None` when no risk section
+/// is configured or when both thresholds are unset — a no-op guard is
+/// pointless overhead, and silently attaching one would hide an obvious
+/// misconfiguration.
+fn build_pnl_guard(cfg: Option<&RiskCfg>) -> Option<PnlGuard> {
+    let cfg = cfg?;
+    if cfg.max_drawdown.is_none() && cfg.max_daily_loss.is_none() {
+        return None;
+    }
+    Some(PnlGuard::new(PnlGuardConfig {
+        max_drawdown: cfg.max_drawdown.map(i128::from),
+        max_daily_loss: cfg.max_daily_loss.map(i128::from),
+        day_length: Duration::from_secs(cfg.day_length_secs),
+    }))
+}
+
 fn wire_kill_switch(
     cfg: Option<&KillSwitchCfg>,
 ) -> (Option<Arc<KillSwitch>>, Option<tokio::task::JoinHandle<()>>) {

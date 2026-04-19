@@ -12,6 +12,7 @@ ts-core = { workspace = true, features = ["serde"] }
 ts-book.workspace = true
 ts-config.workspace = true
 ts-oms.workspace = true
+ts-pnl.workspace = true
 ts-replay.workspace = true
 ts-risk.workspace = true
 ts-strategy.workspace = true

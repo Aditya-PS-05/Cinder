@@ -26,6 +26,32 @@ pub struct LiveCfg {
     pub metrics: Option<MetricsCfg>,
     #[serde(default)]
     pub kill_switch: Option<KillSwitchCfg>,
+    #[serde(default)]
+    pub risk: Option<RiskCfg>,
+}
+
+/// Optional PnL-guard wiring. A missing section leaves the runner
+/// without a guard; a present section with both limits `None` is a
+/// no-op (guard constructed but nothing to trip on). Mantissas match
+/// [`ts_pnl::Accountant`]: `price_scale * qty_scale`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RiskCfg {
+    /// Drop from peak equity (realized-net + unrealized) that trips
+    /// [`ts_risk::TripReason::MaxDrawdown`].
+    #[serde(default)]
+    pub max_drawdown: Option<i64>,
+    /// Realized-net loss since day-start that trips
+    /// [`ts_risk::TripReason::DailyLoss`].
+    #[serde(default)]
+    pub max_daily_loss: Option<i64>,
+    /// Sliding-window length for the daily baseline, in seconds.
+    /// Defaults to 24 h.
+    #[serde(default = "default_day_length_secs")]
+    pub day_length_secs: u64,
+}
+
+fn default_day_length_secs() -> u64 {
+    24 * 60 * 60
 }
 
 /// Optional kill-switch wiring for the live runner. A missing section

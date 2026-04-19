@@ -2107,6 +2107,7 @@ dependencies = [
  "ts-config",
  "ts-core",
  "ts-oms",
+ "ts-pnl",
  "ts-replay",
  "ts-report",
  "ts-risk",

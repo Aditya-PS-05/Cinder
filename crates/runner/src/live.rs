@@ -21,15 +21,16 @@
 //! fills arrive bounded-latency after the user-data-stream lands them.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, Notify};
 use tracing::{debug, error, warn};
 
 use ts_book::OrderBook;
-use ts_core::{ExecReport, Fill, MarketEvent, MarketPayload, Timestamp};
+use ts_core::{ExecReport, Fill, MarketEvent, MarketPayload, Price, Timestamp};
 use ts_oms::OrderEngine;
-use ts_risk::KillSwitch;
+use ts_pnl::Accountant;
+use ts_risk::{KillSwitch, PnlGuard};
 use ts_strategy::{Strategy, StrategyAction};
 
 use crate::audit::AuditEvent;
@@ -67,6 +68,10 @@ pub struct LiveRunner<E: OrderEngine> {
     metrics: Option<Arc<RunnerMetrics>>,
     kill_switch: Option<Arc<KillSwitch>>,
     summary: LiveSummary,
+    /// Tracks realized-net and unrealized PnL for the [`PnlGuard`]. The
+    /// accountant is always constructed; the guard is the opt-in piece.
+    accountant: Accountant,
+    pnl_guard: Option<PnlGuard>,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -111,6 +116,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             audit_tx: None,
             metrics: None,
             kill_switch: None,
+            pnl_guard: None,
         }
     }
 
@@ -120,6 +126,14 @@ impl<E: OrderEngine> LiveRunner<E> {
     /// propagated — a live runner should stay up through transient
     /// venue failures.
     pub async fn run(mut self) -> LiveSummary {
+        // Seed the PnL guard so its daily baseline is pinned to zero
+        // (the start-of-session realized PnL) rather than whatever the
+        // first post-fill snapshot happens to be. Without this first
+        // observe, a batch of fills delivered before the first guard
+        // tick would set the baseline to the already-lossy realized
+        // total, hiding the breach.
+        self.evaluate_pnl_guard();
+
         let mut reconcile = tokio::time::interval(self.reconcile_interval);
         reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         reconcile.tick().await; // skip the immediate tick
@@ -277,6 +291,42 @@ impl<E: OrderEngine> LiveRunner<E> {
                 self.summary.reconcile_errors += 1;
             }
         }
+        self.evaluate_pnl_guard();
+    }
+
+    /// Re-evaluate the configured [`PnlGuard`] against the current
+    /// accountant state and trip the kill switch on a breach. A no-op
+    /// when either the guard or the kill switch is unattached, when the
+    /// switch is already tripped, or when the guard sees no threshold
+    /// crossed.
+    fn evaluate_pnl_guard(&mut self) {
+        let Some(guard) = self.pnl_guard.as_mut() else {
+            return;
+        };
+        let Some(ks) = self.kill_switch.as_ref() else {
+            return;
+        };
+        if ks.tripped() {
+            return;
+        }
+        // LiveRunner is single-symbol today; the local book maps to the
+        // strategy's instrument, so any symbol the accountant tracks
+        // gets this book's mid as its mark. If we ever multiplex more
+        // symbols through one runner this closure needs a per-symbol
+        // book lookup.
+        let mark = self.book.mid().map(Price);
+        let realized_net = self.accountant.realized_net_total();
+        let unrealized = self.accountant.unrealized_total(|_| mark);
+        if let Some(breach) = guard.observe(Instant::now(), realized_net, unrealized) {
+            warn!(
+                ?breach,
+                "live-runner: pnl guard breach; tripping kill switch"
+            );
+            ks.trip(breach.to_trip_reason());
+            if let Some(m) = self.metrics.as_ref() {
+                m.observe_kill_switch(ks);
+            }
+        }
     }
 
     async fn observe_report(&mut self, report: ExecReport) {
@@ -312,6 +362,7 @@ impl<E: OrderEngine> LiveRunner<E> {
 
     async fn observe_fill(&mut self, fill: Fill) {
         self.strategy.on_fill(&fill);
+        self.accountant.on_fill(&fill);
         self.summary.fills += 1;
         if let Some(tx) = self.audit_tx.as_ref() {
             if tx.send(AuditEvent::Fill(fill)).await.is_err() {
@@ -342,6 +393,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
     metrics: Option<Arc<RunnerMetrics>>,
     kill_switch: Option<Arc<KillSwitch>>,
+    pnl_guard: Option<PnlGuard>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -375,6 +427,16 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Attach a [`PnlGuard`]. The runner folds every fill into an
+    /// internal [`Accountant`] and re-evaluates the guard at the end of
+    /// every reconcile tick; a breach trips the attached [`KillSwitch`].
+    /// The guard is a no-op when no [`KillSwitch`] is attached — there
+    /// is no downstream to signal.
+    pub fn pnl_guard(mut self, guard: PnlGuard) -> Self {
+        self.pnl_guard = Some(guard);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -399,6 +461,8 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             metrics: self.metrics,
             kill_switch: self.kill_switch,
             summary: LiveSummary::default(),
+            accountant: Accountant::new(),
+            pnl_guard: self.pnl_guard,
         };
         (runner, handle)
     }
@@ -635,5 +699,151 @@ mod tests {
         let summary = task.await.unwrap();
         assert_eq!(summary.orders_filled, 1);
         assert_eq!(summary.fills, 1, "fill should reach the strategy");
+    }
+
+    #[tokio::test]
+    async fn pnl_guard_breach_trips_kill_switch() {
+        use ts_risk::{KillSwitch, PnlGuardConfig, TripReason};
+        // A single-fill realized loss: SELL at 80 after a BUY at 100
+        // yields realized=-200 before fees, which > 50 → daily-loss
+        // breach. Using one combined push (both fills in one report)
+        // ensures they fold into the accountant in the same reconcile
+        // tick, so the guard re-evaluates once and trips.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+        let inbound = engine.inbound_sender();
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = PnlGuard::new(PnlGuardConfig {
+            max_drawdown: None,
+            max_daily_loss: Some(50),
+            day_length: Duration::from_secs(60),
+        });
+
+        let (_tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .pnl_guard(guard)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        let report = ExecReport {
+            cid: ClientOrderId::new("lossy"),
+            status: OrderStatus::Filled,
+            filled_qty: Qty(0),
+            avg_price: None,
+            reason: None,
+            fills: vec![
+                ts_core::Fill {
+                    cid: ClientOrderId::new("lossy-open"),
+                    venue: venue(),
+                    symbol: sym(),
+                    side: Side::Buy,
+                    price: Price(100),
+                    qty: Qty(10),
+                    ts: Timestamp::default(),
+                    is_maker: None,
+                    fee: 0,
+                    fee_asset: None,
+                },
+                ts_core::Fill {
+                    cid: ClientOrderId::new("lossy-close"),
+                    venue: venue(),
+                    symbol: sym(),
+                    side: Side::Sell,
+                    price: Price(80),
+                    qty: Qty(10),
+                    ts: Timestamp::default(),
+                    is_maker: None,
+                    fee: 0,
+                    fee_asset: None,
+                },
+            ],
+        };
+        inbound.send(report).await.unwrap();
+
+        for _ in 0..40 {
+            if ks.tripped() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(ks.tripped(), "kill switch should trip on realized loss");
+        assert_eq!(ks.reason(), Some(TripReason::DailyLoss));
+    }
+
+    #[tokio::test]
+    async fn pnl_guard_does_not_trip_below_limit() {
+        use ts_risk::{KillSwitch, PnlGuardConfig};
+        // Open + close with a small realized loss of 20; threshold 50.
+        // The guard must stay armed and the kill switch unchanged.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+        let inbound = engine.inbound_sender();
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = PnlGuard::new(PnlGuardConfig {
+            max_drawdown: None,
+            max_daily_loss: Some(50),
+            day_length: Duration::from_secs(60),
+        });
+
+        let (_tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .pnl_guard(guard)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        let report = ExecReport {
+            cid: ClientOrderId::new("mild"),
+            status: OrderStatus::Filled,
+            filled_qty: Qty(0),
+            avg_price: None,
+            reason: None,
+            fills: vec![
+                ts_core::Fill {
+                    cid: ClientOrderId::new("mild-open"),
+                    venue: venue(),
+                    symbol: sym(),
+                    side: Side::Buy,
+                    price: Price(100),
+                    qty: Qty(2),
+                    ts: Timestamp::default(),
+                    is_maker: None,
+                    fee: 0,
+                    fee_asset: None,
+                },
+                ts_core::Fill {
+                    cid: ClientOrderId::new("mild-close"),
+                    venue: venue(),
+                    symbol: sym(),
+                    side: Side::Sell,
+                    price: Price(90),
+                    qty: Qty(2),
+                    ts: Timestamp::default(),
+                    is_maker: None,
+                    fee: 0,
+                    fee_asset: None,
+                },
+            ],
+        };
+        inbound.send(report).await.unwrap();
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(!ks.tripped(), "modest loss must stay below the limit");
     }
 }
