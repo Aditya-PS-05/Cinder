@@ -78,9 +78,18 @@ pub struct RunnerCfg {
     pub timer_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuditCfg {
     pub path: PathBuf,
+    /// `sync_all` cadence on the audit log, expressed in events. `0`
+    /// (the default, or a missing key) disables periodic fsync —
+    /// shutdown still syncs, but unclean exits may lose up to one
+    /// BufWriter's worth of buffered writes. A positive value bounds
+    /// crash loss to at most `fsync_every - 1` events at the cost of
+    /// one fsync per batch. Sensible production values sit in the
+    /// 50–500 range depending on event volume.
+    #[serde(default)]
+    pub fsync_every: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -212,7 +212,17 @@ fn resolve_config(cli: &Cli) -> Result<PaperCfg> {
         cfg.runner.timer_ms = if v == 0 { None } else { Some(v) };
     }
     if let Some(path) = cli.audit.clone() {
-        cfg.audit = Some(AuditCfg { path });
+        // Preserve any YAML-set fsync_every — the CLI flag overrides
+        // only the path, not the durability cadence.
+        match cfg.audit.as_mut() {
+            Some(existing) => existing.path = path,
+            None => {
+                cfg.audit = Some(AuditCfg {
+                    path,
+                    ..Default::default()
+                })
+            }
+        }
     }
     if let Some(listen) = cli.metrics_addr.clone() {
         cfg.metrics = Some(MetricsCfg { listen });
@@ -347,7 +357,8 @@ async fn run(cfg: PaperCfg) -> Result<()> {
     let audit_task = if let Some(audit_cfg) = cfg.audit.as_ref() {
         let writer = AuditWriter::create(&audit_cfg.path)
             .await
-            .context("open audit log")?;
+            .context("open audit log")?
+            .with_fsync_every(audit_cfg.fsync_every);
         let (audit_tx, audit_rx) = mpsc::channel(cfg.runner.channel);
         runner = runner.with_audit(audit_tx);
         Some(spawn_audit_writer(writer, audit_rx))

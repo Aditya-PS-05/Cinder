@@ -219,7 +219,17 @@ fn resolve_config(cli: &Cli) -> Result<LiveCfg> {
         cfg.binance.reconcile_ms = v;
     }
     if let Some(path) = cli.audit.clone() {
-        cfg.audit = Some(AuditCfg { path });
+        // Preserve any YAML-set fsync_every — the CLI flag overrides
+        // only the path, not the durability cadence.
+        match cfg.audit.as_mut() {
+            Some(existing) => existing.path = path,
+            None => {
+                cfg.audit = Some(AuditCfg {
+                    path,
+                    ..Default::default()
+                })
+            }
+        }
     }
     if let Some(path) = cli.intent_log.clone() {
         cfg.intent_log = Some(IntentLogCfg { path });
@@ -427,7 +437,8 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     let audit_task = if let Some(audit_cfg) = cfg.audit.as_ref() {
         let writer = AuditWriter::create(&audit_cfg.path)
             .await
-            .context("open audit log")?;
+            .context("open audit log")?
+            .with_fsync_every(audit_cfg.fsync_every);
         let (audit_tx, audit_rx) = mpsc::channel(cfg.runner.channel);
         builder = builder.audit(audit_tx);
         Some(spawn_audit_writer(writer, audit_rx))
