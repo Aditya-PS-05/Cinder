@@ -65,6 +65,12 @@ enum Cmd {
         half_spread_ticks: i64,
         #[arg(long, default_value_t = 0)]
         imbalance_widen_ticks: i64,
+        /// EWMA decay (must be in (0,1) if --vol-widen-coeff > 0).
+        #[arg(long, default_value_t = 0.94)]
+        vol_lambda: f64,
+        /// Extra half-spread per unit EWMA sigma. 0 disables the tracker.
+        #[arg(long, default_value_t = 0.0)]
+        vol_widen_coeff: f64,
         #[arg(long, default_value_t = 1)]
         inventory_skew_ticks: i64,
         #[arg(long, default_value_t = 20)]
@@ -104,6 +110,8 @@ async fn main() -> Result<()> {
             quote_qty,
             half_spread_ticks,
             imbalance_widen_ticks,
+            vol_lambda,
+            vol_widen_coeff,
             inventory_skew_ticks,
             max_inventory,
             cid_prefix,
@@ -116,6 +124,8 @@ async fn main() -> Result<()> {
                 quote_qty,
                 half_spread_ticks,
                 imbalance_widen_ticks,
+                vol_lambda,
+                vol_widen_coeff,
                 inventory_skew_ticks,
                 max_inventory,
                 cid_prefix,
@@ -206,6 +216,8 @@ async fn run_replay(
     quote_qty: i64,
     half_spread_ticks: i64,
     imbalance_widen_ticks: i64,
+    vol_lambda: f64,
+    vol_widen_coeff: f64,
     inventory_skew_ticks: i64,
     max_inventory: i64,
     cid_prefix: String,
@@ -229,6 +241,8 @@ async fn run_replay(
             quote_qty: Qty(quote_qty),
             half_spread_ticks,
             imbalance_widen_ticks,
+            vol_lambda,
+            vol_widen_coeff,
             inventory_skew_ticks,
             max_inventory,
             cid_prefix,

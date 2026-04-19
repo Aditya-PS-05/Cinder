@@ -33,6 +33,16 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     imbalance_widen_ticks: i64,
 
+    /// EWMA decay for the mid-price volatility tracker. Ignored when
+    /// `vol_widen_coeff` is zero; otherwise must be in `(0, 1)`.
+    #[arg(long, default_value_t = 0.94)]
+    vol_lambda: f64,
+
+    /// Multiplier applied to EWMA sigma (in ticks) to produce extra
+    /// half-spread. Zero disables the vol-aware widening path.
+    #[arg(long, default_value_t = 0.0)]
+    vol_widen_coeff: f64,
+
     /// Inventory skew in ticks per unit of inventory.
     #[arg(long, default_value_t = 1)]
     inventory_skew_ticks: i64,
@@ -56,6 +66,8 @@ fn main() -> Result<()> {
         quote_qty: ts_core::Qty(cli.quote_qty),
         half_spread_ticks: cli.half_spread_ticks,
         imbalance_widen_ticks: cli.imbalance_widen_ticks,
+        vol_lambda: cli.vol_lambda,
+        vol_widen_coeff: cli.vol_widen_coeff,
         inventory_skew_ticks: cli.inventory_skew_ticks,
         max_inventory: cli.max_inventory,
     };

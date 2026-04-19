@@ -76,6 +76,8 @@ fn build_replay() -> Replay<InventorySkewMaker> {
             quote_qty: Qty(2),
             half_spread_ticks: 5,
             imbalance_widen_ticks: 0,
+            vol_lambda: 0.94,
+            vol_widen_coeff: 0.0,
             inventory_skew_ticks: 0,
             max_inventory: 20,
             cid_prefix: "e2e".into(),

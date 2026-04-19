@@ -47,6 +47,8 @@ pub struct MakerTuning {
     pub quote_qty: Qty,
     pub half_spread_ticks: i64,
     pub imbalance_widen_ticks: i64,
+    pub vol_lambda: f64,
+    pub vol_widen_coeff: f64,
     pub inventory_skew_ticks: i64,
     pub max_inventory: i64,
 }
@@ -57,6 +59,8 @@ impl Default for MakerTuning {
             quote_qty: Qty(2),
             half_spread_ticks: 5,
             imbalance_widen_ticks: 0,
+            vol_lambda: 0.94,
+            vol_widen_coeff: 0.0,
             inventory_skew_ticks: 1,
             max_inventory: 20,
         }
@@ -82,6 +86,8 @@ pub fn run_scenario(scenario: &Scenario, tuning: &MakerTuning) -> ReplaySummary 
         quote_qty: tuning.quote_qty,
         half_spread_ticks: tuning.half_spread_ticks,
         imbalance_widen_ticks: tuning.imbalance_widen_ticks,
+        vol_lambda: tuning.vol_lambda,
+        vol_widen_coeff: tuning.vol_widen_coeff,
         inventory_skew_ticks: tuning.inventory_skew_ticks,
         max_inventory: tuning.max_inventory,
         cid_prefix: "bt".into(),

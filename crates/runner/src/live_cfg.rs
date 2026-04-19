@@ -14,7 +14,7 @@ use ts_config::{ConfigError, Env, Loader};
 
 use crate::paper_cfg::{AuditCfg, MakerCfg, MarketCfg, MetricsCfg, RunnerCfg};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct LiveCfg {
     pub market: MarketCfg,
     pub maker: MakerCfg,

@@ -10,7 +10,7 @@
 //! the maker has saturated its long/short bound it suppresses the
 //! corresponding side.
 
-use ts_book::OrderBook;
+use ts_book::{EwmaVol, OrderBook};
 use ts_core::{
     ClientOrderId, ExecReport, Fill, NewOrder, OrderKind, Price, Qty, Side, Symbol, TimeInForce,
     Timestamp, Venue,
@@ -32,6 +32,17 @@ pub struct MakerConfig {
     /// top-of-book queue imbalance approaches ±1 — an adverse-selection
     /// guard that demands more edge when directional flow is likely.
     pub imbalance_widen_ticks: i64,
+    /// Decay factor for the EWMA mid-price volatility tracker. Only
+    /// consulted when `vol_widen_coeff > 0.0`; must be in `(0, 1)` in
+    /// that case (a standard RiskMetrics choice is 0.94). When the
+    /// vol-aware widening is disabled this field is ignored.
+    pub vol_lambda: f64,
+    /// Multiplier applied to the EWMA mid-tick sigma to produce an
+    /// extra half-spread in ticks. Zero disables the volatility path
+    /// entirely (and skips allocating the tracker); positive values
+    /// widen the spread as realised mid-price volatility rises — an
+    /// adverse-selection guard complementary to `imbalance_widen_ticks`.
+    pub vol_widen_coeff: f64,
     /// Per-unit-inventory shift applied to both quotes, in price-scale
     /// ticks. Positive inventory pushes both quotes down (offering more
     /// aggressively, bidding less aggressively) to work back toward flat.
@@ -46,6 +57,10 @@ pub struct MakerConfig {
 
 pub struct InventorySkewMaker {
     cfg: MakerConfig,
+    /// EWMA mid-price volatility tracker. `None` when the vol-aware
+    /// widening path is disabled (`vol_widen_coeff == 0.0`) so we don't
+    /// pay for state we never read.
+    vol: Option<EwmaVol>,
     inventory: i64,
     open_bid: Option<ClientOrderId>,
     open_ask: Option<ClientOrderId>,
@@ -54,8 +69,10 @@ pub struct InventorySkewMaker {
 
 impl InventorySkewMaker {
     pub fn new(cfg: MakerConfig) -> Self {
+        let vol = (cfg.vol_widen_coeff > 0.0).then(|| EwmaVol::new(cfg.vol_lambda));
         Self {
             cfg,
+            vol,
             inventory: 0,
             open_bid: None,
             open_ask: None,
@@ -108,6 +125,14 @@ impl InventorySkewMaker {
 
 impl Strategy for InventorySkewMaker {
     fn on_book_update(&mut self, now: Timestamp, book: &OrderBook) -> Vec<StrategyAction> {
+        // Feed the vol tracker on every tick we have a mid, even on
+        // ticks where we end up not quoting. That keeps the EWMA
+        // monotonic across inventory-cap suppressions and one-sided
+        // books — the signal is about the market, not about us.
+        if let (Some(vol), Some(mid)) = (self.vol.as_mut(), book.mid()) {
+            vol.update(mid);
+        }
+
         let centre = match book.microprice().or_else(|| book.mid()) {
             Some(m) => m,
             None => return Vec::new(),
@@ -117,13 +142,27 @@ impl Strategy for InventorySkewMaker {
         // flow is equally dangerous on both sides because the thin side
         // gets picked off while the heavy side trades against the move.
         // floor() keeps widening conservative — no half-tick rounding up.
-        let widen = if self.cfg.imbalance_widen_ticks > 0 {
+        let imb_widen = if self.cfg.imbalance_widen_ticks > 0 {
             let imb = book.imbalance().unwrap_or(0.0).abs();
             (self.cfg.imbalance_widen_ticks as f64 * imb).floor() as i64
         } else {
             0
         };
-        let half = self.cfg.half_spread_ticks.saturating_add(widen);
+        // Vol widening: add `floor(coeff * sigma_ticks)` extra half-
+        // spread. `sigma` is `None` until the tracker has seen at least
+        // two mids, so the first quote on a fresh session falls through
+        // to the base spread — which is the safe default.
+        let vol_widen = self
+            .vol
+            .as_ref()
+            .and_then(EwmaVol::sigma)
+            .map(|s| (s * self.cfg.vol_widen_coeff).floor() as i64)
+            .unwrap_or(0);
+        let half = self
+            .cfg
+            .half_spread_ticks
+            .saturating_add(imb_widen)
+            .saturating_add(vol_widen);
 
         // Inventory skew shifts both quotes by the same amount, so the
         // spread is preserved but the center of mass walks away from the
@@ -220,6 +259,8 @@ mod tests {
             quote_qty: Qty(10),
             half_spread_ticks: 5,
             imbalance_widen_ticks: 0,
+            vol_lambda: 0.94,
+            vol_widen_coeff: 0.0,
             inventory_skew_ticks: 1,
             max_inventory: 20,
             cid_prefix: "mk".into(),
@@ -305,6 +346,137 @@ mod tests {
         let ask = place_order(&actions[1]);
         assert_eq!(bid.price, Some(Price(97))); // 107 - 10
         assert_eq!(ask.price, Some(Price(117))); // 107 + 10
+    }
+
+    #[test]
+    fn vol_widen_coeff_zero_keeps_spread_fixed_even_on_jittery_ticks() {
+        // Default cfg has vol_widen_coeff = 0.0 — the tracker is not
+        // even allocated, and a wildly jumpy mid must not change the
+        // quoted spread.
+        let mut m = InventorySkewMaker::new(cfg());
+        let book1 = book_with(vec![lvl(100, 10)], vec![lvl(110, 10)]);
+        let book2 = book_with(vec![lvl(500, 10)], vec![lvl(510, 10)]);
+        m.on_book_update(Timestamp::default(), &book1);
+        let actions = m.on_book_update(Timestamp::default(), &book2);
+        let places: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                StrategyAction::Place(o) => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places.len(), 2);
+        // mid=505, half_spread=5. Spread stays 10 ticks wide regardless
+        // of the 400-tick mid jump.
+        assert_eq!(places[0].price, Some(Price(500)));
+        assert_eq!(places[1].price, Some(Price(510)));
+    }
+
+    #[test]
+    fn vol_widening_kicks_in_on_seeded_sigma() {
+        // Configure the vol widening: coeff=2.0, lambda=0.5. The first
+        // tick primes the tracker; the second tick seeds variance from
+        // the delta (no blend on cold start), so sigma equals the
+        // absolute delta. A delta of 3 ticks → widen = floor(2.0*3) = 6.
+        let mut c = cfg();
+        c.vol_widen_coeff = 2.0;
+        c.vol_lambda = 0.5;
+        let mut m = InventorySkewMaker::new(c);
+
+        // Tick 1: mid=105, no sigma yet — quotes at the base spread.
+        let book1 = book_with(vec![lvl(100, 10)], vec![lvl(110, 10)]);
+        let first = m.on_book_update(Timestamp::default(), &book1);
+        let first_bid = place_order(&first[0]);
+        assert_eq!(first_bid.price, Some(Price(100))); // 105 - 5
+
+        // Tick 2: mid=108 (walk +3 ticks). sigma = 3 → widen = 6.
+        // Effective half = 5 + 6 = 11. bid=97, ask=119.
+        let book2 = book_with(vec![lvl(103, 10)], vec![lvl(113, 10)]);
+        let second = m.on_book_update(Timestamp::default(), &book2);
+        let places: Vec<_> = second
+            .iter()
+            .filter_map(|a| match a {
+                StrategyAction::Place(o) => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places.len(), 2);
+        assert_eq!(places[0].price, Some(Price(97))); // 108 - 11
+        assert_eq!(places[1].price, Some(Price(119))); // 108 + 11
+    }
+
+    #[test]
+    fn vol_widening_decays_on_calm_ticks_after_a_shock() {
+        // lambda=0.5, coeff=1.0. Shock: tick 1 primes (mid=100), tick 2
+        // jumps to mid=110 seeding variance=100 → sigma=10 → widen=10.
+        // Tick 3: mid stays at 110 → variance = 0.5*100 + 0.5*0 = 50 →
+        // sigma ≈ 7.07 → widen = floor(7.07) = 7. Widening must shrink.
+        let mut c = cfg();
+        c.vol_widen_coeff = 1.0;
+        c.vol_lambda = 0.5;
+        let mut m = InventorySkewMaker::new(c);
+
+        let book_100 = book_with(vec![lvl(95, 10)], vec![lvl(105, 10)]);
+        let book_110 = book_with(vec![lvl(105, 10)], vec![lvl(115, 10)]);
+        m.on_book_update(Timestamp::default(), &book_100); // priming
+        let shock = m.on_book_update(Timestamp::default(), &book_110);
+        let ask_after_shock = shock
+            .iter()
+            .find_map(|a| match a {
+                StrategyAction::Place(o) if o.side == Side::Sell => Some(o),
+                _ => None,
+            })
+            .unwrap();
+        // mid=110, half = 5 + 10 = 15. ask = 125.
+        assert_eq!(ask_after_shock.price, Some(Price(125)));
+
+        let calm = m.on_book_update(Timestamp::default(), &book_110);
+        let ask_after_calm = calm
+            .iter()
+            .find_map(|a| match a {
+                StrategyAction::Place(o) if o.side == Side::Sell => Some(o),
+                _ => None,
+            })
+            .unwrap();
+        // widen = floor(sqrt(50)) = 7. half = 12. ask = 122.
+        assert_eq!(ask_after_calm.price, Some(Price(122)));
+    }
+
+    #[test]
+    fn vol_widen_stacks_with_imbalance_widen() {
+        // Both widening paths active. We verify they sum rather than
+        // either taking precedence.
+        let mut c = cfg();
+        c.imbalance_widen_ticks = 10;
+        c.vol_widen_coeff = 1.0;
+        c.vol_lambda = 0.5;
+        let mut m = InventorySkewMaker::new(c);
+
+        // Prime with a symmetric book (imbalance 0, no vol yet).
+        let prime = book_with(vec![lvl(100, 10)], vec![lvl(110, 10)]);
+        m.on_book_update(Timestamp::default(), &prime);
+
+        // Now jump by 4 ticks AND run a 30:10 imbalance — widen should
+        // stack to floor(1*4) + floor(10*0.5) = 4 + 5 = 9 extra ticks.
+        // microprice(100*10 + 114*30)/40... wait let's recompute:
+        // book: bids=[104, 30], asks=[114, 10]. mid=(104+114)/2=109.
+        // microprice = (104*10 + 114*30)/40 = (1040 + 3420)/40 = 111.
+        // delta from prime (mid=105) to this mid (109) = 4, sigma seeded=4.
+        // half = 5 + 4 + 5 = 14. bid=111-14=97, ask=111+14=125.
+        let next = book_with(vec![lvl(104, 30)], vec![lvl(114, 10)]);
+        let actions = m.on_book_update(Timestamp::default(), &next);
+        // Tick 2 begins with two Cancels for the prime-tick quotes,
+        // then the two new Places we want to inspect.
+        let places: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                StrategyAction::Place(o) => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places.len(), 2);
+        assert_eq!(places[0].price, Some(Price(97)));
+        assert_eq!(places[1].price, Some(Price(125)));
     }
 
     #[test]

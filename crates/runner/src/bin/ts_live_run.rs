@@ -239,6 +239,8 @@ async fn run(cfg: LiveCfg) -> Result<()> {
         quote_qty: Qty(cfg.maker.quote_qty),
         half_spread_ticks: cfg.maker.half_spread_ticks,
         imbalance_widen_ticks: cfg.maker.imbalance_widen_ticks,
+        vol_lambda: cfg.maker.vol_lambda,
+        vol_widen_coeff: cfg.maker.vol_widen_coeff,
         inventory_skew_ticks: cfg.maker.inventory_skew_ticks,
         max_inventory: cfg.maker.max_inventory,
         cid_prefix: cfg.maker.cid_prefix.clone(),

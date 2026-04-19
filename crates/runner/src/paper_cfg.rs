@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use ts_config::{ConfigError, Env, Loader};
 
 /// Root config tree.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct PaperCfg {
     pub market: MarketCfg,
     pub maker: MakerCfg,
@@ -34,7 +34,7 @@ pub struct MarketCfg {
     pub ws_url: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MakerCfg {
     pub quote_qty: i64,
     pub half_spread_ticks: i64,
@@ -43,9 +43,23 @@ pub struct MakerCfg {
     /// that predate this field still load cleanly via the default.
     #[serde(default)]
     pub imbalance_widen_ticks: i64,
+    /// EWMA decay factor for the mid-price volatility tracker. Must be
+    /// in `(0, 1)` if `vol_widen_coeff > 0`, otherwise ignored.
+    /// Defaults to 0.94 (RiskMetrics).
+    #[serde(default = "default_vol_lambda")]
+    pub vol_lambda: f64,
+    /// Multiplier applied to EWMA sigma (in ticks) to compute extra
+    /// half-spread. Zero disables the vol-aware widening path. Older
+    /// YAML configs that predate this field load cleanly via the default.
+    #[serde(default)]
+    pub vol_widen_coeff: f64,
     pub inventory_skew_ticks: i64,
     pub max_inventory: i64,
     pub cid_prefix: String,
+}
+
+fn default_vol_lambda() -> f64 {
+    0.94
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -82,6 +96,8 @@ impl Default for MakerCfg {
             quote_qty: 2,
             half_spread_ticks: 5,
             imbalance_widen_ticks: 0,
+            vol_lambda: default_vol_lambda(),
+            vol_widen_coeff: 0.0,
             inventory_skew_ticks: 1,
             max_inventory: 20,
             cid_prefix: "pr".into(),
