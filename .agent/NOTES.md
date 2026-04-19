@@ -1,87 +1,84 @@
 # Cinder build notes
 
 ## Current phase (2026-04-19)
-Harden kill-switch trip semantics so open orders get canceled on
-the venue within one reconcile tick of a trip, rather than
-lingering until process exit. Closes the "Tripped-switch drops
-ALL strategy actions including Cancels" follow-up from the
-previous phase.
+Add FIFO tax-lot accounting to ts-pnl alongside the existing WAC
+`Accountant`. Closes section 8's P0 "Realized vs unrealized
+split, FIFO tax lots" — the split itself already shipped with the
+WAC accountant; FIFO lots were the missing half.
 
 ## What shipped this phase
-- `LiveRunner::handle_market_event` now short-circuits before
-  calling `strategy.on_book_update` when the kill switch is
-  tripped. Prior behavior ticked the strategy, then dropped every
-  emitted action — which silently advanced the maker's cid
-  tracking for quotes we never actually placed, creating drift
-  between the maker's internal view and the venue. Paper's
-  `PaperEngine::apply_event` already honored this invariant via
-  the `paused` flag; live now matches.
-- New `LiveRunner::apply_trip_sweep` runs at the tail of every
-  `drain_reconcile` tick. On the first tick where the switch is
-  tripped, it calls `strategy.on_shutdown()` and forwards the
-  resulting `Cancel` actions to the engine. Places that come
-  back from `on_shutdown` (a strategy bug — the trait is
-  cancel-only) are logged and dropped. Tracked via a new
-  `swept_after_trip: bool` field; resets when the switch clears
-  so operator reset + re-trip fires another sweep.
-- New `LiveRunner::last_event_ts: Timestamp` field replaces the
-  prior `run`-local `last_ts` so the sweep path can stamp
-  cancels with a consistent timestamp without threading the
-  value through three callers. `drain_strategy_shutdown` reads
-  the same field on graceful exit.
-- `EngineRunner::apply_trip_sweep` is the paper analog: runs on
-  each event-processed + summary tick, calls
-  `replay.drain_shutdown(last_ts)` (which bypasses the engine's
-  `paused` flag), forwards the resulting reports to the audit
-  sink, and refreshes metrics. Same `swept_after_trip` latch.
-- Tests: `kill_switch_trip_cancels_open_quotes_via_reconcile_sweep`,
-  `trip_sweep_fires_once_per_halted_epoch`, and
-  `halted_runner_skips_strategy_tick` on the live side;
-  `kill_switch_trip_triggers_cancel_sweep` and
-  `trip_sweep_runs_once_per_halted_epoch` on the paper side.
+- New `ts-pnl::tax_lots` module exporting `LotAccountant`,
+  `LotBook`, `TaxLot`, `ClosedLot`. Public API surface mirrors
+  the WAC `Accountant` (`on_fill`, `position`, `realized`,
+  `realized_net`, `fees`, `unrealized`, `iter`) so a runner can
+  swap accounting models without touching anything else.
+- FIFO semantics: every opening fill enqueues a lot;
+  opposing fills consume the oldest lot first, producing one
+  `ClosedLot { opened_side, qty, entry, exit, opened, closed,
+  realized }` per matched slice. Overshoot on an opposing fill
+  drains the queue, flips the side, and enqueues the remainder
+  as a fresh lot at the fill price.
+- `LotAccountant::on_fill` returns the `Vec<ClosedLot>` realized
+  by that fill so the runner can stream tax-lot events without a
+  second diff against `closed_lots()`.
+- Quote-denominated commissions accumulate on `LotBook::fees`
+  the same way the WAC accountant tracks them. Cross-asset
+  commissions (fee=0, non-quote label) are preserved on the
+  `Fill` but skipped by both accountants — converting them to
+  quote is out of scope for pnl.
+- 16 unit tests: opens, extensions (separate lots, no blending),
+  partial close, multi-lot close via overflow, exact close,
+  flip-with-remainder, short-side realize on both lower and
+  higher buybacks, per-lot unrealized for long and short queues,
+  per-symbol unrealized_total, closed-lot timestamps preserved,
+  fee accumulation, cross-asset fee ignored, zero-qty +
+  Unknown-side noops, FIFO-vs-WAC identity on single-cycle
+  round trips. All pass; full workspace test + clippy green.
 
 ## Design calls
-- **Edge-triggered, latched**: one sweep per halted epoch, not
-  per reconcile tick. Re-entering `on_shutdown` after the
-  strategy has already cleared its tracked cids would flood the
-  cancel path with `unknown cid` rejects, which `record_reject`
-  would count against the kill-switch's own reject-rate
-  trigger. The `swept_after_trip` latch resets on clear so
-  operator reset → re-trip still gets a fresh sweep.
-- **Skip strategy tick while halted, not just actions**:
-  emitting and then ignoring a Place would keep the maker's
-  `open_bid`/`open_ask` populated with cids that never existed
-  on the venue; the next cancel for those would fail as
-  `unknown cid`. Skipping the tick entirely keeps the maker's
-  state consistent with reality.
-- **Drop Places from `on_shutdown`, log once**: the trait
-  contract is cancel-only, but a defensive filter avoids
-  re-entering risk / venue with a new order right after we
-  tripped to stop exposure.
-- **Run sweep in `drain_reconcile`, not in the trip path
-  itself**: the kill switch is a shared `Arc<KillSwitch>`
-  tripped from many places (halt-file watcher, PnL guard,
-  reject-rate). Tying the sweep to the runner's own reconcile
-  tick keeps the cleanup single-threaded with the engine's
-  submit/cancel machinery — no async re-entry into the same
-  `OrderEngine`.
+- **Additive, not replacement.** The runner, risk guard, report,
+  and metrics all hinge on the WAC `Accountant`. Keeping FIFO
+  side-by-side means nothing upstream has to change this phase;
+  a later phase can add a `--pnl-mode=fifo` runtime switch if
+  the research/tax desk actually needs FIFO gauges live.
+- **No automatic averaging on extension.** Same-side fills
+  always enqueue as distinct lots so the closed-lot history is
+  tax-lot-grade (one buy = one acquired lot). WAC is the
+  alternative for anyone who wants blended cost basis.
+- **Closed-lot emission on realization, not on close-all.** Every
+  opposing slice is its own `ClosedLot`. A Sell of 12 against
+  two Buy lots of 10+10 emits two ClosedLots (10 @ lot1, 2 @
+  lot2). This matches 8949's "acquired/disposed per lot" model.
+- **Position + side derivation from queue, not a separate
+  field.** `LotBook::position()` sums `qty` across open lots and
+  signs by front lot's side. Invariant: queue is homogeneous in
+  side or empty; `apply_fill` enforces it by draining before
+  flipping. A `debug_assert!` catches accidental interleave.
+- **Cross-asset fees: skip silently.** Matches the WAC
+  accountant's contract. A future conversion pass can walk
+  `Fill.fee_asset` against a rate oracle — parked until
+  someone actually needs cross-asset PnL accuracy.
 
 ## Follow-ups
-- Trip sweep currently fires once per runner even when multiple
-  trip reasons stack. If a drawdown trip clears and a
-  reject-rate trip fires, the latch re-arms on clear — no
-  action needed. But an operator who trips manually mid-sweep
-  sees only one sweep for the whole halted epoch, not one per
-  reason. Probably fine; re-visit if we ever want per-reason
-  audit tagging.
-- True auto-flatten (submit closing market orders to zero out
-  position) still needs a position-reversal helper. Parked
-  until SOR scaffolding exists — see section 5 in `todo.md`.
-- Per-symbol illegal-transition labels once the runner
-  multiplexes more than one instrument. Still process-global.
-- Cross-asset commission accounting; guard under-counts daily
-  loss whenever BNB-discounted fees are material.
-- Manual-intervention audit log (section 13 P0) — halt-file
-  trips and operator resets are logged, but free-form
-  `/admin/halt` style RPCs don't have a dedicated append-only
-  log yet.
+- Surface FIFO metrics through the runner: `ts_fifo_realized`,
+  `ts_fifo_unrealized`, `ts_fifo_open_lots`. Needs a config
+  switch + a second Accountant instance in EngineRunner /
+  LiveRunner. Kept out of this phase to stay tight.
+- Report crate: add a `--pnl-mode=fifo` pass that re-runs the
+  fill stream through `LotAccountant` and emits a closed-lot CSV
+  alongside the existing PnL curve. Deferred.
+- Lot-level serde for closed-lot persistence / export. The types
+  are already `Clone + Copy + Debug + Eq`; serde derives can
+  land in a follow-up once the audit sink grows a tax-lot event.
+- Gas + bridge fees (section 8's DEX side) still need a dedicated
+  capture path. Neither accountant touches them yet.
+- Cross-asset commission conversion (BNB discount in particular).
+  Both accountants under-count fees whenever BNB-denominated
+  commissions are material on Binance.
+
+## Prior phase (2026-04-18)
+Edge-triggered kill-switch cancel sweep on both EngineRunner and
+LiveRunner. See commit `80377ff` and preceding notes for full
+rationale; summary: one sweep per halted epoch via
+`swept_after_trip` latch, strategy tick skipped while halted,
+`Place`s emitted from `on_shutdown` dropped with a log.

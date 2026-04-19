@@ -34,6 +34,10 @@ use std::collections::HashMap;
 
 use ts_core::{Fill, Price, Side, Symbol};
 
+pub mod tax_lots;
+
+pub use tax_lots::{ClosedLot, LotAccountant, LotBook, TaxLot};
+
 /// Per-symbol accounting state.
 #[derive(Clone, Debug, Default)]
 pub struct SymbolBook {
