@@ -312,11 +312,23 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     let (tx, rx) = mpsc::channel::<MarketEvent>(cfg.runner.channel);
     let bridge = bridge_bus(sub, tx);
 
+    // Construct the user-data-stream client up front so its
+    // illegal-transition counter can be wired into the runner's
+    // Prometheus metrics before `build()` finalises the runner.
+    let user_cfg = UserDataStreamConfig::new(
+        cfg.binance.user_ws_base.clone(),
+        venue.clone(),
+        specs.clone(),
+    );
+    let user_client = UserDataStreamClient::new(user_cfg, Arc::clone(&rest));
+    let stream_illegal_counter = user_client.illegal_transitions_counter();
+
     let mut builder = LiveRunner::builder(engine, strategy, rx)
         .reconcile_interval(Duration::from_millis(cfg.binance.reconcile_ms))
         .risk_config(build_risk_config(
             cfg.risk.as_ref().and_then(|r| r.pre_trade.as_ref()),
-        ));
+        ))
+        .stream_illegal_counter(stream_illegal_counter);
 
     let summary_interval = Duration::from_secs(cfg.runner.summary_secs);
     if !summary_interval.is_zero() {
@@ -386,10 +398,9 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     let md_task = tokio::spawn(async move { md_for_task.run().await });
 
     // User-data-stream: venue-side exec reports flow from the WS into
-    // the engine's inbound sender so `reconcile` surfaces them.
-    let user_cfg =
-        UserDataStreamConfig::new(cfg.binance.user_ws_base.clone(), venue.clone(), specs);
-    let user_client = UserDataStreamClient::new(user_cfg, Arc::clone(&rest));
+    // the engine's inbound sender so `reconcile` surfaces them. The
+    // client was constructed above so its illegal-transition counter
+    // could be wired into metrics.
     let user_task = tokio::spawn(async move {
         if let Err(err) = user_client.run(inbound).await {
             tracing::error!(error = %err, "user-data-stream session ended with error");

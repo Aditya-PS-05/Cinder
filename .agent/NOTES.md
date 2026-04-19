@@ -1,69 +1,63 @@
 # Cinder build notes
 
 ## Current phase (2026-04-19)
-Pre-trade risk wiring for the LIVE runner — finishes the task
-started last phase (Section 7 P0 "Pre-trade checks"), so the
-gate sits in front of `BinanceLiveEngine::submit` as well as
-`PaperEngine`.
+Wire the user-data-stream listener's illegal-transition counter
+into `RunnerMetrics` so operators can see stream-vs-REST provenance
+side by side. Finishes the follow-up parked in the last session.
 
 ## What shipped this phase
-- `LiveRunner` owns a `RiskEngine` (default `RiskConfig::permissive()`)
-  plus a `HashSet<ClientOrderId>` of cids it has reserved a slot for.
-  New builder method `risk_config(RiskConfig)` seeds it.
-- New helper `LiveRunner::submit_with_risk` runs the gate before every
-  strategy-emitted `Place` (both hot path and shutdown sweep):
-  - Computes ref-price from the local book (Limit → `order.price`,
-    Market → opposite side, no fallback) — mirrors
-    `PaperEngine::reference_price`.
-  - Risk rejection → synthesized `ExecReport::rejected` routed through
-    `observe_report`, so the audit tap, strategy callback, metrics,
-    and kill-switch reject-rate all see it. `engine.submit` never
-    fires, so no transport cost and no venue rejection.
-  - Risk pass → `record_submit` + `live_cids.insert` before calling
-    the engine. Transport error rolls back the reservation.
-- `observe_fill` calls `risk.record_fill`; `observe_report` calls
-  `risk.record_complete` when the status is terminal AND the cid is
-  in `live_cids`. Externally-injected cids (arriving via the
-  user-data-stream through `engine.inbound_sender`) never reserved a
-  slot, so they won't spuriously decrement `open_orders`.
-- `ts-live-run` now accepts the same pre-trade surface as
-  `ts-paper-run`: CLI flags `--max-position-qty`, `--max-order-notional`,
-  `--max-open-orders`, `--whitelist` (comma-separated) layered on top
-  of the shared `risk.pre_trade.*` YAML section.
-- Extracted `build_risk_config` from `ts_paper_run.rs` to
-  `ts_runner::lib.rs` so paper and live share one folding helper.
-  Divergence here has historically been a silent source of paper-vs-live
-  drift — single source of truth now.
-- Two new tests in `crates/runner/src/live.rs`:
-  - `pre_trade_whitelist_rejects_orders_before_reaching_venue` — seeds
-    a whitelist that excludes BTCUSDT with an empty `QueuedApi` (whose
-    `pop()` panics on call); the runner drives the maker on a snapshot,
-    both quotes surface as Rejected, `orders_submitted == 0`,
-    `reconcile_errors == 0` proving the transport was never touched.
-  - `pre_trade_notional_cap_blocks_oversized_order` — tightens
-    `max_order_notional` to 1 and asserts the same gate behavior.
+- `UserDataStreamClient::illegal_transitions_counter() -> Arc<AtomicU64>`
+  exposes the listener's internal counter as a shared handle.
+  `TransitionGuard::illegal` flipped from `AtomicU64` to
+  `Arc<AtomicU64>` so cloning the handle is cheap and every
+  publish stays lock-free (single load).
+- `RunnerMetrics` now keeps two counters side by side:
+  `illegal_transitions_engine` and `illegal_transitions_stream`.
+  Encoding moved from the unlabeled `ts_illegal_transitions_total`
+  to a labeled series:
+  - `ts_illegal_transitions_total{source="engine"}` — REST reconcile
+    path, sourced from `OrderEngine::illegal_transitions`.
+  - `ts_illegal_transitions_total{source="stream"}` — user-data-stream
+    listener, sourced from the shared `Arc<AtomicU64>`.
+  Both series are emitted unconditionally (default 0) so scrapes don't
+  race on first-seen-label behaviour.
+- `LiveRunnerBuilder::stream_illegal_counter(Arc<AtomicU64>)` wires
+  the listener counter into the runner. `LiveRunner::drain_reconcile`
+  publishes both counters on every tick; when no stream counter is
+  attached the `stream` series stays pegged at 0.
+- `ts-live-run`: reordered the binary so `UserDataStreamClient::new`
+  runs before `LiveRunner::builder` finalizes — the builder needs
+  the counter handle before `build()`. The WS-run task still owns
+  the client by value.
 
 ## Design calls
-- `live_cids` is a set, not a counter: the `RiskEngine` open-order
-  counter is a single integer, so without a set we'd have no way to
-  tell "cid we tracked" from "cid we never saw". External pushes
-  (user-data-stream) are explicit first-class inputs here and the
-  counter must stay monotonic for them.
-- `orders_submitted` is incremented only AFTER `risk.check` passes,
-  matching the paper runner's replay summary which counts
-  risk-rejected orders as `orders_rejected` (not submitted).
-- `reference_price` has no fallback — the live runner never had a
-  `notional_fallback_price` config and adding one felt like scope
-  creep. The maker only emits Limit orders today, so the Market
-  branch is theoretical.
-- `submit_with_risk` takes a `&str err_ctx` so the existing "submit
-  failed" vs "shutdown submit failed" log strings survive the
-  refactor. Keeps log-grep contracts intact.
+- Labels over multiple metric names: `ts_illegal_transitions_total`
+  with a `source=` label keeps cardinality bounded (exactly 2 today)
+  and lets a single Grafana panel sum or break it out. Adding
+  a second unlabeled counter would force duplicate HELP/TYPE lines
+  and split dashboards.
+- `Arc<AtomicU64>` over a callback: `fn() -> u64` would work but
+  closes over state that the runner doesn't need to own. The `Arc`
+  clone is the lightest coupling that still keeps the publish path
+  lock-free.
+- Always emit both labels at 0 (rather than lazy-emit when observed):
+  Prometheus treats missing series as "missing", not "zero", which
+  would hide a healthy stream and break `rate()` on the series at
+  startup. The cost of the extra line is two bytes.
+- `LiveRunner` takes `Option<Arc<AtomicU64>>` — tests that don't
+  attach a stream counter still want the engine counter to publish.
 
 ## Follow-ups
-- Leverage + cross-venue exposure still unshipped (need perps/margin
+- Per-symbol label on the illegal-transition counter once the runner
+  multiplexes more than one instrument. Currently both sources are
+  process-global counts.
+- Tie `illegal_transitions_stream > 0` into an alert — a stream
+  reorder once an hour is noise, a sustained climb means the listener
+  is falling behind its reconcile peer and fills might be getting
+  suppressed.
+- Leverage + cross-venue exposure still unshipped (needs perps/margin
   data and a cross-venue exposure tracker).
-- Per-symbol `ts_position{symbol="..."}` labeled gauges once the
+- Per-symbol `ts_position{symbol="..."}` labelled gauges once the
   runner multiplexes more than one instrument.
 - True auto-flatten (submit closing orders on breach) still needs a
   position-reversal helper. Park until SOR scaffolding exists.
@@ -72,7 +66,3 @@ gate sits in front of `BinanceLiveEngine::submit` as well as
   alive until the runner exits and the shutdown sweep runs.
 - Cross-asset commission accounting still open; guard under-counts
   daily loss whenever BNB-discounted fees are material.
-- `RiskEngine::check` takes `&self` but `record_submit` takes
-  `&mut self`. The submit-then-check ordering inside
-  `submit_with_risk` is single-threaded today, but if we ever
-  parallelize quote emission per symbol, expect contention here.

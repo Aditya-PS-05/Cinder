@@ -102,6 +102,15 @@ impl UserDataStreamClient {
         self.guard.illegal_count()
     }
 
+    /// Shared handle for the listener's illegal-transition counter so
+    /// the runner can publish it into Prometheus on its own cadence
+    /// without holding a reference back to the client. The returned
+    /// `Arc<AtomicU64>` is the same counter [`Self::illegal_transitions`]
+    /// reads — cloning it is cheap and reads stay lock-free.
+    pub fn illegal_transitions_counter(&self) -> Arc<AtomicU64> {
+        self.guard.illegal_counter()
+    }
+
     /// Run one session end-to-end: create a listenKey, open the WS,
     /// decode frames onto `report_tx`, refresh the listenKey on a
     /// timer, close the listenKey on shutdown. Returns when the WS
@@ -210,7 +219,7 @@ impl UserDataStreamClient {
 #[derive(Debug, Default)]
 pub(crate) struct TransitionGuard {
     cache: Mutex<HashMap<ClientOrderId, OrderStatus>>,
-    illegal: AtomicU64,
+    illegal: Arc<AtomicU64>,
 }
 
 impl TransitionGuard {
@@ -247,6 +256,10 @@ impl TransitionGuard {
 
     pub(crate) fn illegal_count(&self) -> u64 {
         self.illegal.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn illegal_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.illegal)
     }
 }
 
@@ -673,6 +686,21 @@ mod tests {
         // still fail — Filled is absorbing. Verify the cache stayed pinned.
         assert!(!g.admit(&report("stale", OrderStatus::New)));
         assert_eq!(g.illegal_count(), 3);
+    }
+
+    #[test]
+    fn transition_guard_counter_is_shared_across_clones() {
+        // The shared handle lets the runner publish the stream's
+        // illegal count into Prometheus without holding a reference to
+        // the client. Bumps made through the guard must be visible
+        // through the cloned handle immediately.
+        let g = TransitionGuard::new();
+        let shared = g.illegal_counter();
+        assert_eq!(shared.load(Ordering::Relaxed), 0);
+        assert!(g.admit(&report("shared", OrderStatus::Filled)));
+        assert!(!g.admit(&report("shared", OrderStatus::New)));
+        assert_eq!(shared.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.load(Ordering::Relaxed), g.illegal_count());
     }
 
     #[test]

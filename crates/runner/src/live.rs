@@ -21,6 +21,7 @@
 //! fills arrive bounded-latency after the user-data-stream lands them.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -89,6 +90,13 @@ pub struct LiveRunner<E: OrderEngine> {
     /// (`engine.inbound_sender()`) wouldn't be in this set and so won't
     /// decrement the open-order counter.
     live_cids: HashSet<ClientOrderId>,
+    /// Shared handle to the user-data-stream listener's cumulative
+    /// illegal-transition counter. `None` when no listener is attached
+    /// (e.g. the paper runner's live-engine tests). The runner loads
+    /// the counter once per reconcile tick and mirrors it into the
+    /// `source="stream"` metric series so operators can see
+    /// stream-vs-REST provenance side by side.
+    stream_illegal_counter: Option<Arc<AtomicU64>>,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -135,6 +143,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             kill_switch: None,
             pnl_guard: None,
             risk_config: RiskConfig::permissive(),
+            stream_illegal_counter: None,
         }
     }
 
@@ -354,12 +363,19 @@ impl<E: OrderEngine> LiveRunner<E> {
                 self.summary.reconcile_errors += 1;
             }
         }
-        // Mirror the engine's cumulative illegal-transition counter
-        // into Prometheus on every tick. Cheap (single atomic load +
-        // store) and the only call site, so the gauge tracks the engine
-        // even on quiet reconcile passes.
+        // Mirror the cumulative illegal-transition counters into
+        // Prometheus on every tick. Two sources: the engine (REST
+        // reconcile path) and, when attached, the user-data-stream
+        // listener — each surfaces under its own `source=` label so
+        // operators can tell whether stale frames come in via push or
+        // pull. Cheap (single atomic load + store per source) and the
+        // only publish site, so the counters track even on quiet
+        // reconcile passes.
         if let Some(m) = self.metrics.as_ref() {
-            m.observe_illegal_transitions(self.engine.illegal_transitions());
+            m.observe_engine_illegal_transitions(self.engine.illegal_transitions());
+            if let Some(c) = self.stream_illegal_counter.as_ref() {
+                m.observe_stream_illegal_transitions(c.load(Ordering::Relaxed));
+            }
         }
         self.evaluate_pnl_guard();
     }
@@ -490,6 +506,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     kill_switch: Option<Arc<KillSwitch>>,
     pnl_guard: Option<PnlGuard>,
     risk_config: RiskConfig,
+    stream_illegal_counter: Option<Arc<AtomicU64>>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -542,6 +559,17 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Wire the user-data-stream listener's illegal-transition counter
+    /// (e.g. [`ts_binance::UserDataStreamClient::illegal_transitions_counter`])
+    /// into the runner so its value reaches the
+    /// `ts_illegal_transitions_total{source="stream"}` Prometheus series
+    /// on every reconcile tick. Without this, the stream series stays
+    /// pegged at zero even while the listener drops reordered frames.
+    pub fn stream_illegal_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.stream_illegal_counter = Some(counter);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -570,6 +598,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             pnl_guard: self.pnl_guard,
             risk: RiskEngine::new(self.risk_config),
             live_cids: HashSet::new(),
+            stream_illegal_counter: self.stream_illegal_counter,
         };
         (runner, handle)
     }
@@ -886,12 +915,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn illegal_transition_count_is_mirrored_into_runner_metrics() {
+    async fn engine_illegal_transition_count_is_mirrored_into_runner_metrics() {
         // Push two reports for the same cid: a FILLED then a stale
         // PARTIALLY_FILLED. The engine drops the stale one and bumps its
         // illegal_transitions counter; the runner must mirror that into
         // RunnerMetrics on the next reconcile tick so /metrics surfaces
-        // it as ts_illegal_transitions_total.
+        // it under the `source="engine"` label.
         let api = QueuedApi::new(vec![]);
         let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
         let inbound = engine.inbound_sender();
@@ -936,7 +965,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             if metrics
                 .encode_prometheus()
-                .contains("ts_illegal_transitions_total 1")
+                .contains("ts_illegal_transitions_total{source=\"engine\"} 1")
             {
                 saw_one = true;
                 break;
@@ -946,10 +975,68 @@ mod tests {
         handle.shutdown();
         let _ = task.await.unwrap();
 
+        let body = metrics.encode_prometheus();
         assert!(
             saw_one,
-            "expected ts_illegal_transitions_total 1 in metrics, got:\n{}",
-            metrics.encode_prometheus()
+            "expected ts_illegal_transitions_total{{source=\"engine\"}} 1, got:\n{body}"
+        );
+        // Without a stream-counter wired, the stream series must stay
+        // pegged at zero — proving the engine bump didn't leak across
+        // labels.
+        assert!(
+            body.contains("ts_illegal_transitions_total{source=\"stream\"} 0"),
+            "stream series should stay at 0, got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_illegal_counter_is_published_under_stream_label() {
+        // A fake stream counter stands in for UserDataStreamClient's
+        // Arc<AtomicU64>. Bumping it between reconcile ticks must
+        // surface under the `source="stream"` label without touching
+        // the engine-label series.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let stream_counter = Arc::new(AtomicU64::new(0));
+        let metrics = RunnerMetrics::new();
+        let (_tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .metrics(Arc::clone(&metrics))
+            .stream_illegal_counter(Arc::clone(&stream_counter))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        // Simulate the listener dropping four reordered frames. The
+        // counter is monotone so the runner publishes whatever it sees.
+        stream_counter.store(4, Ordering::Relaxed);
+
+        let mut saw_stream = false;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if metrics
+                .encode_prometheus()
+                .contains("ts_illegal_transitions_total{source=\"stream\"} 4")
+            {
+                saw_stream = true;
+                break;
+            }
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        let body = metrics.encode_prometheus();
+        assert!(
+            saw_stream,
+            "expected ts_illegal_transitions_total{{source=\"stream\"}} 4, got:\n{body}"
+        );
+        // Engine label stays at zero — no stale REST acks in this test.
+        assert!(
+            body.contains("ts_illegal_transitions_total{source=\"engine\"} 0"),
+            "engine series should stay at 0, got:\n{body}"
         );
     }
 

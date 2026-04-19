@@ -134,11 +134,21 @@ pub struct RunnerMetrics {
     kill_switch_reason: AtomicU64,
 
     /// Cumulative count of [`ts_core::ExecReport`]s the live engine has
-    /// dropped because the prev → next transition violated
-    /// [`ts_core::OrderStatus::can_transition_to`]. Sourced from
-    /// [`ts_oms::OrderEngine::illegal_transitions`] on every reconcile
-    /// tick; non-decreasing.
-    illegal_transitions: AtomicU64,
+    /// dropped on its REST/reconcile path because the prev → next
+    /// transition violated [`ts_core::OrderStatus::can_transition_to`].
+    /// Sourced from [`ts_oms::OrderEngine::illegal_transitions`] on every
+    /// reconcile tick; non-decreasing. Surfaces as
+    /// `ts_illegal_transitions_total{source="engine"}`.
+    illegal_transitions_engine: AtomicU64,
+
+    /// Cumulative count of stale reports the user-data-stream listener
+    /// dropped before they reached the engine channel. Sourced from
+    /// [`ts_binance::UserDataStreamClient::illegal_transitions_counter`]
+    /// on every reconcile tick. Surfaces as
+    /// `ts_illegal_transitions_total{source="stream"}` so operators can
+    /// tell whether bad edges come in via the push stream or get caught
+    /// in the engine's REST-ack path.
+    illegal_transitions_stream: AtomicU64,
 
     /// `local_ts - exchange_ts` per observed event. Captures the
     /// WS → decoder → runner leg; ignores events the venue did not
@@ -211,12 +221,22 @@ impl RunnerMetrics {
         self.kill_switch_reason.store(code, Ordering::Relaxed);
     }
 
-    /// Publish the engine's cumulative illegal-transition count into the
-    /// `ts_illegal_transitions_total` counter. The value is monotone in
-    /// the source — overwriting on each call is safe and keeps the
-    /// publish path lock-free.
-    pub fn observe_illegal_transitions(&self, value: u64) {
-        self.illegal_transitions.store(value, Ordering::Relaxed);
+    /// Publish the live engine's cumulative illegal-transition count
+    /// into the `ts_illegal_transitions_total{source="engine"}` series.
+    /// The source counter is monotone so overwriting on each call is
+    /// safe and keeps the publish path lock-free.
+    pub fn observe_engine_illegal_transitions(&self, value: u64) {
+        self.illegal_transitions_engine
+            .store(value, Ordering::Relaxed);
+    }
+
+    /// Publish the user-data-stream listener's cumulative
+    /// illegal-transition count into the
+    /// `ts_illegal_transitions_total{source="stream"}` series. Same
+    /// contract as [`Self::observe_engine_illegal_transitions`].
+    pub fn observe_stream_illegal_transitions(&self, value: u64) {
+        self.illegal_transitions_stream
+            .store(value, Ordering::Relaxed);
     }
 
     /// Record a single [`MarketEvent`]'s exchange→local latency into the
@@ -454,11 +474,20 @@ impl RunnerMetrics {
             "Trip reason: 0 armed, 1 reject-rate, 2 manual, 3 external, 4 max-drawdown, 5 daily-loss.",
             self.kill_switch_reason.load(Ordering::Relaxed) as i64,
         );
-        counter(
-            &mut out,
-            "ts_illegal_transitions_total",
-            "ExecReports dropped by the live engine on illegal OrderStatus transitions.",
-            self.illegal_transitions.load(Ordering::Relaxed),
+        let _ = writeln!(
+            out,
+            "# HELP ts_illegal_transitions_total ExecReports dropped on illegal OrderStatus transitions, split by provenance (engine = REST reconcile path, stream = user-data-stream listener)."
+        );
+        let _ = writeln!(out, "# TYPE ts_illegal_transitions_total counter");
+        let _ = writeln!(
+            out,
+            "ts_illegal_transitions_total{{source=\"engine\"}} {}",
+            self.illegal_transitions_engine.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "ts_illegal_transitions_total{{source=\"stream\"}} {}",
+            self.illegal_transitions_stream.load(Ordering::Relaxed)
         );
         self.ingest_latency_nanos.encode(
             &mut out,
@@ -837,31 +866,52 @@ mod tests {
     }
 
     #[test]
-    fn observe_illegal_transitions_emits_counter_with_latest_value() {
+    fn illegal_transitions_emits_labeled_series_for_engine_and_stream() {
         let m = RunnerMetrics::new();
-        // Counter starts at zero and is published on every observe call.
+        // Counter starts at zero and both label series are always
+        // emitted so scrapes don't race on first-seen-symbol behavior.
         let body0 = m.encode_prometheus();
         assert!(
             body0.contains("# TYPE ts_illegal_transitions_total counter"),
             "counter type line missing, got:\n{body0}"
         );
         assert!(
-            body0.contains("ts_illegal_transitions_total 0"),
-            "default value should be 0, got:\n{body0}"
+            body0.contains("ts_illegal_transitions_total{source=\"engine\"} 0"),
+            "engine series should default to 0, got:\n{body0}"
         );
-        m.observe_illegal_transitions(7);
+        assert!(
+            body0.contains("ts_illegal_transitions_total{source=\"stream\"} 0"),
+            "stream series should default to 0, got:\n{body0}"
+        );
+
+        // Engine-side: simulate the live engine's cumulative counter
+        // advancing past stale REST reports.
+        m.observe_engine_illegal_transitions(7);
+        // Stream-side: simulate the user-data-stream listener dropping
+        // a reordered frame before it reached the engine channel.
+        m.observe_stream_illegal_transitions(3);
         let body1 = m.encode_prometheus();
         assert!(
-            body1.contains("ts_illegal_transitions_total 7"),
-            "expected updated value, got:\n{body1}"
+            body1.contains("ts_illegal_transitions_total{source=\"engine\"} 7"),
+            "expected engine=7, got:\n{body1}"
         );
-        // Source is monotone — overwriting with a larger value is the
-        // common case and must surface unchanged.
-        m.observe_illegal_transitions(11);
+        assert!(
+            body1.contains("ts_illegal_transitions_total{source=\"stream\"} 3"),
+            "expected stream=3, got:\n{body1}"
+        );
+
+        // Both sources are monotone — overwriting with a larger value
+        // is the common case. Each series updates independently.
+        m.observe_engine_illegal_transitions(11);
+        m.observe_stream_illegal_transitions(5);
         let body2 = m.encode_prometheus();
         assert!(
-            body2.contains("ts_illegal_transitions_total 11"),
-            "expected latest value, got:\n{body2}"
+            body2.contains("ts_illegal_transitions_total{source=\"engine\"} 11"),
+            "expected engine=11, got:\n{body2}"
+        );
+        assert!(
+            body2.contains("ts_illegal_transitions_total{source=\"stream\"} 5"),
+            "expected stream=5, got:\n{body2}"
         );
     }
 
