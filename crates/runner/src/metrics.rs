@@ -681,6 +681,7 @@ mod tests {
             unrealized: 50,
             total_pnl: 150,
             mark: mark.map(Price),
+            invariant_violations: Vec::new(),
         }
     }
 

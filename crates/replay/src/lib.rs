@@ -14,6 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod invariants;
+
 use ts_book::BookError;
 use ts_core::{
     ClientOrderId, ExecReport, Fill, MarketEvent, NewOrder, OrderStatus, Price, Timestamp,
@@ -21,6 +23,8 @@ use ts_core::{
 use ts_oms::{EngineStep, OrderEngine, PaperEngine};
 use ts_pnl::Accountant;
 use ts_strategy::Strategy;
+
+pub use invariants::{Invariant, InvariantCtx, InvariantViolation};
 
 #[derive(Default, Debug, Clone)]
 pub struct ReplayMetrics {
@@ -56,12 +60,18 @@ pub struct ReplaySummary {
     /// Final mark price used for `unrealized` — the book mid. `None`
     /// when the book is one-sided or uninitialized.
     pub mark: Option<Price>,
+    /// Every breach of a registered [`Invariant`] observed during
+    /// replay, in chronological order. Empty when no invariants are
+    /// registered or all invariants held across every tick.
+    pub invariant_violations: Vec<InvariantViolation>,
 }
 
 pub struct Replay<S: Strategy> {
     engine: PaperEngine<S>,
     accountant: Accountant,
     metrics: ReplayMetrics,
+    invariants: Vec<Box<dyn Invariant>>,
+    violations: Vec<InvariantViolation>,
 }
 
 impl<S: Strategy> Replay<S> {
@@ -70,7 +80,23 @@ impl<S: Strategy> Replay<S> {
             engine,
             accountant: Accountant::new(),
             metrics: ReplayMetrics::default(),
+            invariants: Vec::new(),
+            violations: Vec::new(),
         }
+    }
+
+    /// Register an [`Invariant`] for evaluation after every replay
+    /// event. Multiple invariants may be registered; each is checked
+    /// in registration order. Breaches are accumulated rather than
+    /// aborting replay.
+    pub fn register_invariant(&mut self, inv: Box<dyn Invariant>) {
+        self.invariants.push(inv);
+    }
+
+    /// Breaches observed so far. Also exposed through
+    /// [`ReplaySummary::invariant_violations`].
+    pub fn violations(&self) -> &[InvariantViolation] {
+        &self.violations
     }
 
     pub fn engine(&self) -> &PaperEngine<S> {
@@ -110,6 +136,7 @@ impl<S: Strategy> Replay<S> {
             self.metrics.book_updates += 1;
         }
         self.absorb_step(&step);
+        self.run_invariants();
         Ok(step)
     }
 
@@ -138,6 +165,7 @@ impl<S: Strategy> Replay<S> {
         for f in &report.fills {
             self.absorb_fill(f);
         }
+        self.run_invariants();
         report
     }
 
@@ -145,6 +173,7 @@ impl<S: Strategy> Replay<S> {
     pub fn cancel_taker(&mut self, cid: &ClientOrderId) -> ExecReport {
         let report = OrderEngine::cancel(&mut self.engine, cid).expect("PaperEngine is infallible");
         self.absorb_report(&report);
+        self.run_invariants();
         report
     }
 
@@ -155,6 +184,7 @@ impl<S: Strategy> Replay<S> {
     pub fn drain_shutdown(&mut self, now: Timestamp) -> EngineStep {
         let step = self.engine.drain_shutdown(now);
         self.absorb_step(&step);
+        self.run_invariants();
         step
     }
 
@@ -169,6 +199,7 @@ impl<S: Strategy> Replay<S> {
     pub fn tick_timer(&mut self, now: Timestamp) -> EngineStep {
         let step = self.engine.apply_timer(now);
         self.absorb_step(&step);
+        self.run_invariants();
         step
     }
 
@@ -188,6 +219,32 @@ impl<S: Strategy> Replay<S> {
             unrealized,
             total_pnl: realized + unrealized,
             mark,
+            invariant_violations: self.violations.clone(),
+        }
+    }
+
+    /// Evaluate every registered invariant against the current state
+    /// and append any breaches to `self.violations`. Called once per
+    /// public mutating entry point so a single tick can't slip by
+    /// unchecked.
+    fn run_invariants(&mut self) {
+        if self.invariants.is_empty() {
+            return;
+        }
+        let symbol = self.engine.config().symbol.clone();
+        let ctx = InvariantCtx {
+            symbol: &symbol,
+            accountant: &self.accountant,
+            metrics: &self.metrics,
+        };
+        for inv in self.invariants.iter_mut() {
+            if let Some(detail) = inv.check(&ctx) {
+                self.violations.push(InvariantViolation {
+                    invariant: inv.name(),
+                    after_events: self.metrics.events_ingested,
+                    detail,
+                });
+            }
         }
     }
 
@@ -537,5 +594,50 @@ mod tests {
         let s = r.summary();
         assert_eq!(s.mark, None);
         assert_eq!(s.unrealized, 0);
+    }
+
+    #[test]
+    fn registered_position_bound_captures_breach_on_oversized_taker_fill() {
+        use crate::invariants::PositionBound;
+        let mut r = Replay::new(engine());
+        r.register_invariant(Box::new(PositionBound { cap: 0 }));
+        r.step(&snapshot(vec![lvl(100, 10)], vec![lvl(110, 10)], 1))
+            .unwrap();
+        // Taker fill lifts position off zero; cap=0 must breach.
+        r.submit_taker(market_order("t1", Side::Buy, 3), Timestamp::default());
+        let s = r.summary();
+        assert!(!s.invariant_violations.is_empty());
+        assert_eq!(s.invariant_violations[0].invariant, "position_bound");
+        assert!(s.invariant_violations[0].detail.contains("cap=0"));
+    }
+
+    #[test]
+    fn no_invariants_registered_produces_empty_violations_vec() {
+        let mut r = Replay::new(engine());
+        r.run(vec![
+            snapshot(vec![lvl(100, 10)], vec![lvl(110, 10)], 1),
+            snapshot(vec![lvl(101, 10)], vec![lvl(109, 10)], 2),
+        ])
+        .unwrap();
+        let s = r.summary();
+        assert!(s.invariant_violations.is_empty());
+        assert!(r.violations().is_empty());
+    }
+
+    #[test]
+    fn gross_filled_qty_monotone_holds_across_normal_replay() {
+        use crate::invariants::GrossFilledQtyMonotone;
+        let mut r = Replay::new(engine());
+        r.register_invariant(Box::new(GrossFilledQtyMonotone::new()));
+        r.step(&snapshot(vec![lvl(100, 10)], vec![lvl(110, 10)], 1))
+            .unwrap();
+        r.submit_taker(market_order("t1", Side::Buy, 2), Timestamp::default());
+        r.submit_taker(market_order("t2", Side::Buy, 3), Timestamp::default());
+        let s = r.summary();
+        assert!(
+            s.invariant_violations.is_empty(),
+            "monotone counter should never regress in a normal run, got {:?}",
+            s.invariant_violations,
+        );
     }
 }
