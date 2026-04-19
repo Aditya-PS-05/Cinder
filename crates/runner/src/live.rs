@@ -69,6 +69,11 @@ pub struct LiveRunner<E: OrderEngine> {
     reconcile_interval: Duration,
     summary_tx: Option<broadcast::Sender<LiveSummary>>,
     summary_interval: Duration,
+    /// Cadence at which [`Strategy::on_timer`] fires, independent of
+    /// market events and reconcile ticks. Zero disables the tick. Pairs
+    /// with the same knob on [`crate::EngineRunner`] so paper and live
+    /// share one configuration surface for time-scheduled strategies.
+    timer_interval: Duration,
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
     metrics: Option<Arc<RunnerMetrics>>,
     kill_switch: Option<Arc<KillSwitch>>,
@@ -153,6 +158,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             reconcile_interval: Duration::from_millis(100),
             summary_interval: Duration::from_secs(0),
             summary_capacity: 0,
+            timer_interval: Duration::ZERO,
             audit_tx: None,
             metrics: None,
             kill_switch: None,
@@ -189,6 +195,15 @@ impl<E: OrderEngine> LiveRunner<E> {
             Some(i)
         };
 
+        let mut timer_ticker = if self.timer_interval.is_zero() {
+            None
+        } else {
+            let mut i = tokio::time::interval(self.timer_interval);
+            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            i.tick().await; // burn the immediate fire
+            Some(i)
+        };
+
         loop {
             tokio::select! {
                 biased;
@@ -209,6 +224,14 @@ impl<E: OrderEngine> LiveRunner<E> {
                 }
                 _ = reconcile.tick() => {
                     self.drain_reconcile().await;
+                }
+                _ = async {
+                    match timer_ticker.as_mut() {
+                        Some(i) => { i.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.handle_timer_tick().await;
                 }
                 _ = async {
                     match summary_ticker.as_mut() {
@@ -299,29 +322,51 @@ impl<E: OrderEngine> LiveRunner<E> {
         }
     }
 
+    /// Fire [`Strategy::on_timer`] on the runner-driven cadence and
+    /// dispatch emitted actions through the same path the market-event
+    /// branch uses. Halted runners short-circuit: ticking and then
+    /// discarding actions would advance the strategy's cid tracking
+    /// for orders we're not actually placing, exactly the invariant
+    /// [`Self::handle_market_event`] enforces by skipping `on_book_update`
+    /// while the kill switch is tripped.
+    async fn handle_timer_tick(&mut self) {
+        if self.kill_switch.as_ref().is_some_and(|ks| ks.tripped()) {
+            return;
+        }
+        let actions = self.strategy.on_timer(self.last_event_ts);
+        self.dispatch_actions(actions, self.last_event_ts).await;
+    }
+
     async fn handle_market_event(&mut self, event: MarketEvent) {
         self.summary.events_ingested += 1;
 
-        let ticked = match &event.payload {
+        enum TickKind<'a> {
+            Book,
+            Trade(&'a ts_core::Trade),
+            Skip,
+        }
+
+        let kind = match &event.payload {
             MarketPayload::BookSnapshot(s) => {
                 self.book.apply_snapshot(s, event.seq);
                 self.summary.book_updates += 1;
-                true
+                TickKind::Book
             }
             MarketPayload::BookDelta(d) => match self.book.apply_delta(d, event.seq) {
                 Ok(()) => {
                     self.summary.book_updates += 1;
-                    true
+                    TickKind::Book
                 }
                 Err(err) => {
                     warn!(error = ?err, "live-runner: book delta error, dropping");
                     return;
                 }
             },
-            _ => false,
+            MarketPayload::Trade(t) => TickKind::Trade(t),
+            _ => TickKind::Skip,
         };
 
-        if !ticked {
+        if matches!(kind, TickKind::Skip) {
             return;
         }
 
@@ -338,12 +383,23 @@ impl<E: OrderEngine> LiveRunner<E> {
             return;
         }
 
-        let actions = self.strategy.on_book_update(event.local_ts, &self.book);
+        let actions = match kind {
+            TickKind::Book => self.strategy.on_book_update(event.local_ts, &self.book),
+            TickKind::Trade(t) => self.strategy.on_trade(event.local_ts, t),
+            TickKind::Skip => unreachable!(),
+        };
+        self.dispatch_actions(actions, event.local_ts).await;
+    }
+
+    /// Route a batch of strategy actions through the venue: `Place` goes
+    /// through the pre-trade gate + engine submit, `Cancel` goes
+    /// straight to `engine.cancel`. Shared between the book-update,
+    /// trade, and timer paths so the dispatch rules stay identical.
+    async fn dispatch_actions(&mut self, actions: Vec<StrategyAction>, now: Timestamp) {
         for action in actions {
             match action {
                 StrategyAction::Place(order) => {
-                    self.submit_with_risk(order, event.local_ts, "submit failed")
-                        .await;
+                    self.submit_with_risk(order, now, "submit failed").await;
                 }
                 StrategyAction::Cancel(cid) => match self.engine.cancel(&cid) {
                     Ok(report) => self.observe_report(report).await,
@@ -574,6 +630,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     reconcile_interval: Duration,
     summary_interval: Duration,
     summary_capacity: usize,
+    timer_interval: Duration,
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
     metrics: Option<Arc<RunnerMetrics>>,
     kill_switch: Option<Arc<KillSwitch>>,
@@ -591,6 +648,16 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
     pub fn summary_tap(mut self, interval: Duration, capacity: usize) -> Self {
         self.summary_interval = interval;
         self.summary_capacity = capacity;
+        self
+    }
+
+    /// Fire [`Strategy::on_timer`] on this cadence even when the feed
+    /// is silent. Zero disables the tick entirely. Matches the
+    /// [`crate::EngineRunner::with_timer_interval`] knob on the paper
+    /// side so both runners share one knob for time-scheduled
+    /// strategies.
+    pub fn timer_interval(mut self, d: Duration) -> Self {
+        self.timer_interval = d;
         self
     }
 
@@ -663,6 +730,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             reconcile_interval: self.reconcile_interval,
             summary_tx,
             summary_interval: self.summary_interval,
+            timer_interval: self.timer_interval,
             audit_tx: self.audit_tx,
             metrics: self.metrics,
             kill_switch: self.kill_switch,
@@ -1381,6 +1449,170 @@ mod tests {
         assert_eq!(summary.orders_canceled, 0);
         assert_eq!(summary.events_ingested, 1);
         assert_eq!(summary.book_updates, 1);
+    }
+
+    /// Strategy that emits one Cancel the first time a trade lands.
+    /// Book updates are a no-op so we can observe the trade-driven
+    /// branch in isolation. Cancel of an unknown cid surfaces as a
+    /// Rejected report synchronously, letting the test assert the
+    /// fanout without any HTTP traffic.
+    struct TradeReactiveCanceler {
+        fired: bool,
+    }
+    impl Strategy for TradeReactiveCanceler {
+        fn on_book_update(&mut self, _now: Timestamp, _book: &OrderBook) -> Vec<StrategyAction> {
+            Vec::new()
+        }
+        fn on_trade(&mut self, _now: Timestamp, _trade: &ts_core::Trade) -> Vec<StrategyAction> {
+            if self.fired {
+                return Vec::new();
+            }
+            self.fired = true;
+            vec![StrategyAction::Cancel(ClientOrderId::new("no-such-order"))]
+        }
+        fn on_fill(&mut self, _fill: &Fill) {}
+    }
+
+    #[tokio::test]
+    async fn trade_payload_reaches_strategy_on_trade_and_actions_dispatch() {
+        // An empty QueuedApi proves the cancel path doesn't hit HTTP:
+        // BinanceLiveEngine::cancel short-circuits unknown cids to a
+        // synchronous Rejected report. If the trade payload weren't
+        // routed to on_trade, orders_rejected would stay at 0.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let strategy: Box<dyn Strategy> = Box::new(TradeReactiveCanceler { fired: false });
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, strategy, rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(MarketEvent {
+            venue: venue(),
+            symbol: sym(),
+            exchange_ts: Timestamp::default(),
+            local_ts: Timestamp::default(),
+            seq: 1,
+            payload: MarketPayload::Trade(ts_core::Trade {
+                id: "t1".into(),
+                price: Price(10_000),
+                qty: Qty(1_000),
+                taker_side: Side::Buy,
+            }),
+        })
+        .await
+        .unwrap();
+
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(summary.events_ingested, 1);
+        assert_eq!(summary.book_updates, 0, "trade must not bump book counter");
+        assert_eq!(
+            summary.orders_rejected, 1,
+            "Cancel of an unknown cid from on_trade must surface as Rejected"
+        );
+        // No transport errors — the unknown-cid short-circuit never
+        // touches QueuedApi, so pop() is never called.
+        assert_eq!(summary.reconcile_errors, 0);
+    }
+
+    /// Strategy that emits exactly one Cancel from `on_timer` — used
+    /// to prove the live runner's timer branch routes actions through
+    /// `dispatch_actions`. The target cid is unknown to the engine so
+    /// `BinanceLiveEngine::cancel` short-circuits synchronously with
+    /// a Rejected report and never hits `QueuedApi::pop`.
+    struct TimerCancelOnce {
+        fired: bool,
+    }
+    impl Strategy for TimerCancelOnce {
+        fn on_book_update(&mut self, _now: Timestamp, _book: &OrderBook) -> Vec<StrategyAction> {
+            Vec::new()
+        }
+        fn on_fill(&mut self, _fill: &Fill) {}
+        fn on_timer(&mut self, _now: Timestamp) -> Vec<StrategyAction> {
+            if self.fired {
+                return Vec::new();
+            }
+            self.fired = true;
+            vec![StrategyAction::Cancel(ClientOrderId::new("no-such-order"))]
+        }
+    }
+
+    #[tokio::test]
+    async fn timer_tick_invokes_on_timer_and_dispatches_actions() {
+        // Empty QueuedApi: a single submit would panic on pop(), and
+        // a normal cancel RPC would too. The only way orders_rejected
+        // can reach 1 without any market events is the runner's
+        // timer branch calling on_timer → dispatch_actions → engine.cancel,
+        // which synthesises a Rejected for the unknown cid synchronously.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let strategy: Box<dyn Strategy> = Box::new(TimerCancelOnce { fired: false });
+        let (_tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, strategy, rx)
+            .reconcile_interval(Duration::from_millis(50))
+            .timer_interval(Duration::from_millis(20))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+        assert_eq!(summary.events_ingested, 0, "no market events should flow");
+        assert!(
+            summary.orders_rejected >= 1,
+            "timer-driven cancel must surface Rejected; got {:?}",
+            summary
+        );
+        assert_eq!(summary.reconcile_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn halted_live_runner_skips_timer_ticks() {
+        use ts_risk::{KillSwitch, TripReason};
+        // An empty QueuedApi guarantees any submit call would panic
+        // on pop(). Tripping the switch before any tick fires and then
+        // advancing time must yield orders_rejected == 0 — proof
+        // `handle_timer_tick` short-circuits before touching
+        // `dispatch_actions`.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        ks.trip(TripReason::Manual);
+
+        let strategy: Box<dyn Strategy> = Box::new(TimerCancelOnce { fired: false });
+        let (_tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, strategy, rx)
+            .reconcile_interval(Duration::from_millis(50))
+            .timer_interval(Duration::from_millis(20))
+            .kill_switch(Arc::clone(&ks))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+        assert_eq!(summary.orders_rejected, 0);
+        assert_eq!(summary.orders_submitted, 0);
+        assert_eq!(summary.reconcile_errors, 0);
     }
 
     #[tokio::test]

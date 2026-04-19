@@ -100,6 +100,11 @@ struct Cli {
     #[arg(long)]
     channel: Option<usize>,
 
+    /// Cadence at which the runner fires `Strategy::on_timer`, in
+    /// milliseconds. Omit (or pass zero) to disable the timer tick.
+    #[arg(long)]
+    timer_ms: Option<u64>,
+
     /// Append every ExecReport and Fill to this NDJSON file. Overrides
     /// the YAML `audit.path` when set.
     #[arg(long)]
@@ -203,6 +208,9 @@ fn resolve_config(cli: &Cli) -> Result<PaperCfg> {
     if let Some(v) = cli.channel {
         cfg.runner.channel = v;
     }
+    if let Some(v) = cli.timer_ms {
+        cfg.runner.timer_ms = if v == 0 { None } else { Some(v) };
+    }
     if let Some(path) = cli.audit.clone() {
         cfg.audit = Some(AuditCfg { path });
     }
@@ -299,6 +307,9 @@ async fn run(cfg: PaperCfg) -> Result<()> {
 
     let summary_interval = Duration::from_secs(cfg.runner.summary_secs);
     let (mut runner, handle) = EngineRunner::with_summary_tap(replay, rx, summary_interval, 8);
+    if let Some(ms) = cfg.runner.timer_ms {
+        runner = runner.with_timer_interval(Duration::from_millis(ms));
+    }
 
     let (kill_switch, halt_watcher) = wire_kill_switch(cfg.kill_switch.as_ref());
     if let Some(ks) = kill_switch.as_ref() {

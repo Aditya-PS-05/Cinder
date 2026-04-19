@@ -124,22 +124,23 @@ impl<S: Strategy> PaperEngine<S> {
     /// caller can drive resync. Non-book payloads are accepted but
     /// do not tick the strategy.
     pub fn apply_event(&mut self, event: &MarketEvent) -> Result<EngineStep, BookError> {
-        let ticked = match &event.payload {
+        match &event.payload {
             MarketPayload::BookSnapshot(s) => {
                 self.book.apply_snapshot(s, event.seq);
-                true
             }
             MarketPayload::BookDelta(d) => {
                 self.book.apply_delta(d, event.seq)?;
-                true
             }
-            MarketPayload::Trade(_) | MarketPayload::Funding(_) | MarketPayload::Liquidation(_) => {
-                false
+            MarketPayload::Trade(t) => {
+                if self.paused {
+                    return Ok(EngineStep::default());
+                }
+                let actions = self.strategy.on_trade(event.local_ts, t);
+                return Ok(self.process_actions(actions, event.local_ts));
             }
-        };
-
-        if !ticked {
-            return Ok(EngineStep::default());
+            MarketPayload::Funding(_) | MarketPayload::Liquidation(_) => {
+                return Ok(EngineStep::default());
+            }
         }
 
         if self.paused {
@@ -152,6 +153,21 @@ impl<S: Strategy> PaperEngine<S> {
         }
         let actions = self.strategy.on_book_update(event.local_ts, &self.book);
         Ok(self.process_actions(actions, event.local_ts))
+    }
+
+    /// Drive a wall-clock timer tick into the strategy and run any
+    /// emitted actions through the engine. Called by runners on a
+    /// configured cadence so time-scheduled strategies (TWAP slices,
+    /// heartbeat cancels) can act on a silent feed. The `paused` gate
+    /// applies — a halted engine never calls `on_timer`, mirroring how
+    /// it skips `on_book_update`. `drain_shutdown` remains the only
+    /// path that can emit strategy actions while paused.
+    pub fn apply_timer(&mut self, now: Timestamp) -> EngineStep {
+        if self.paused {
+            return EngineStep::default();
+        }
+        let actions = self.strategy.on_timer(now);
+        self.process_actions(actions, now)
     }
 
     /// Drive the strategy's shutdown hook and run every returned action
@@ -368,12 +384,127 @@ mod tests {
     }
 
     #[test]
-    fn trade_payload_does_not_tick_strategy() {
+    fn trade_payload_invokes_on_trade_and_default_impl_emits_nothing() {
+        // The default `Strategy::on_trade` is empty, so the maker —
+        // which doesn't override it — must stay silent on trade prints.
         let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), maker());
         let step = e.apply_event(&trade_event()).unwrap();
         assert!(step.reports.is_empty());
         assert!(step.fills.is_empty());
         assert!(e.live_orders().is_empty());
+    }
+
+    /// Strategy that posts a single limit quote the first time
+    /// `on_trade` fires. Used to prove the engine actually routes Trade
+    /// payloads through the strategy.
+    struct TradeQuoter {
+        symbol: Symbol,
+        venue: Venue,
+        fired: bool,
+    }
+    impl Strategy for TradeQuoter {
+        fn on_book_update(&mut self, _now: Timestamp, _book: &OrderBook) -> Vec<StrategyAction> {
+            Vec::new()
+        }
+        fn on_trade(&mut self, _now: Timestamp, _trade: &Trade) -> Vec<StrategyAction> {
+            if self.fired {
+                return Vec::new();
+            }
+            self.fired = true;
+            vec![StrategyAction::Place(NewOrder {
+                cid: ClientOrderId::new("on-trade-1"),
+                venue: self.venue.clone(),
+                symbol: self.symbol.clone(),
+                side: Side::Buy,
+                kind: OrderKind::Limit,
+                tif: TimeInForce::Gtc,
+                qty: Qty(1),
+                price: Some(Price(50)),
+                ts: Timestamp::default(),
+            })]
+        }
+        fn on_fill(&mut self, _fill: &Fill) {}
+    }
+
+    #[test]
+    fn trade_payload_fans_out_to_on_trade_and_actions_reach_engine() {
+        let s = TradeQuoter {
+            symbol: sym(),
+            venue: venue(),
+            fired: false,
+        };
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), s);
+        // Seed a book so the submit-side reference-price check passes —
+        // the quote is a limit so it uses its own price, but the
+        // executor still needs a book to rest against.
+        e.apply_event(&snapshot_event(vec![lvl(100, 5)], vec![lvl(110, 5)], 1))
+            .unwrap();
+        let step = e.apply_event(&trade_event()).unwrap();
+        assert_eq!(step.reports.len(), 1);
+        assert_eq!(step.reports[0].status, OrderStatus::New);
+        assert_eq!(e.live_orders().len(), 1);
+    }
+
+    #[test]
+    fn paused_engine_drops_on_trade_actions() {
+        let s = TradeQuoter {
+            symbol: sym(),
+            venue: venue(),
+            fired: false,
+        };
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), s);
+        e.apply_event(&snapshot_event(vec![lvl(100, 5)], vec![lvl(110, 5)], 1))
+            .unwrap();
+        e.set_paused(true);
+        let step = e.apply_event(&trade_event()).unwrap();
+        assert!(step.reports.is_empty());
+        assert!(e.live_orders().is_empty());
+    }
+
+    /// Timer-only strategy that emits one cancel the first time
+    /// `on_timer` fires. Proves `apply_timer` walks the action list.
+    struct TimerCanceler {
+        target: ClientOrderId,
+        fired: bool,
+    }
+    impl Strategy for TimerCanceler {
+        fn on_book_update(&mut self, _now: Timestamp, _book: &OrderBook) -> Vec<StrategyAction> {
+            Vec::new()
+        }
+        fn on_fill(&mut self, _fill: &Fill) {}
+        fn on_timer(&mut self, _now: Timestamp) -> Vec<StrategyAction> {
+            if self.fired {
+                return Vec::new();
+            }
+            self.fired = true;
+            vec![StrategyAction::Cancel(self.target.clone())]
+        }
+    }
+
+    #[test]
+    fn apply_timer_fans_out_to_on_timer_and_actions_reach_engine() {
+        let s = TimerCanceler {
+            target: ClientOrderId::new("nope"),
+            fired: false,
+        };
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), s);
+        // No such live order; cancel_internal surfaces Rejected — which
+        // is exactly the signal we use to prove the action ran.
+        let step = e.apply_timer(Timestamp::default());
+        assert_eq!(step.reports.len(), 1);
+        assert_eq!(step.reports[0].status, OrderStatus::Rejected);
+    }
+
+    #[test]
+    fn paused_engine_drops_on_timer_actions() {
+        let s = TimerCanceler {
+            target: ClientOrderId::new("nope"),
+            fired: false,
+        };
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), s);
+        e.set_paused(true);
+        let step = e.apply_timer(Timestamp::default());
+        assert!(step.reports.is_empty());
     }
 
     #[test]

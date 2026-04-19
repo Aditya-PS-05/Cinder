@@ -70,6 +70,12 @@ fn default_vol_lambda() -> f64 {
 pub struct RunnerCfg {
     pub summary_secs: u64,
     pub channel: usize,
+    /// Cadence at which the runner fires [`ts_strategy::Strategy::on_timer`],
+    /// in milliseconds. `None` (the default) disables the timer tick
+    /// entirely — strategies that don't override `on_timer` pay no
+    /// overhead. Wired identically on `ts-paper-run` and `ts-live-run`.
+    #[serde(default)]
+    pub timer_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -203,6 +209,7 @@ impl Default for RunnerCfg {
         Self {
             summary_secs: 5,
             channel: 4096,
+            timer_ms: None,
         }
     }
 }
@@ -328,6 +335,38 @@ risk:
             Some(&["BTCUSDT".to_string(), "ETHUSDT".to_string()][..])
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn timer_ms_defaults_to_none_and_round_trips() {
+        // Absent section → None (default impl + Deserialize default).
+        assert!(RunnerCfg::default().timer_ms.is_none());
+
+        let dir = tmpdir("timer-ms");
+        write(
+            &dir.join("base.yaml"),
+            r#"
+market:
+  symbol: BTCUSDT
+  price_scale: 2
+  qty_scale: 8
+  ws_url: wss://x
+maker:
+  quote_qty: 1
+  half_spread_ticks: 4
+  inventory_skew_ticks: 0
+  max_inventory: 10
+  cid_prefix: t
+runner:
+  summary_secs: 0
+  channel: 128
+  timer_ms: 250
+"#,
+        );
+        write(&dir.join("dev.yaml"), "{}\n");
+        let cfg = PaperCfg::load(&dir, Env::Dev).unwrap();
+        assert_eq!(cfg.runner.timer_ms, Some(250));
         fs::remove_dir_all(&dir).ok();
     }
 

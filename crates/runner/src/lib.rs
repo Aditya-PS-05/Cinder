@@ -45,6 +45,12 @@ pub struct EngineRunner<S: Strategy> {
     shutdown: Arc<Notify>,
     summary_tx: Option<broadcast::Sender<ReplaySummary>>,
     summary_interval: Duration,
+    /// Runner-driven cadence for `Strategy::on_timer`. Zero disables
+    /// the tick entirely so strategies that don't override `on_timer`
+    /// don't pay for a ticker that's guaranteed to be empty. Mirrors
+    /// [`crate::live::LiveRunner::timer_interval`] so paper and live
+    /// share one knob.
+    timer_interval: Duration,
     audit_tx: Option<mpsc::Sender<AuditEvent>>,
     metrics: Option<Arc<RunnerMetrics>>,
     kill_switch: Option<Arc<KillSwitch>>,
@@ -111,6 +117,7 @@ impl<S: Strategy> EngineRunner<S> {
             shutdown,
             summary_tx,
             summary_interval: interval,
+            timer_interval: Duration::ZERO,
             audit_tx: None,
             metrics: None,
             kill_switch: None,
@@ -118,6 +125,18 @@ impl<S: Strategy> EngineRunner<S> {
             swept_after_trip: false,
         };
         (runner, handle)
+    }
+
+    /// Tick [`Strategy::on_timer`] on the configured cadence. Zero
+    /// disables the tick entirely. The ticker fires independently of
+    /// market events, so time-scheduled strategies (TWAP slices,
+    /// heartbeat cancels, stale-quote pruning) make progress even on
+    /// a silent feed. The kill-switch gate applies: a halted engine
+    /// drops timer-emitted actions the same way it drops book-driven
+    /// ones.
+    pub fn with_timer_interval(mut self, interval: Duration) -> Self {
+        self.timer_interval = interval;
+        self
     }
 
     /// Attach a channel that receives every [`ExecReport`] and [`Fill`]
@@ -178,6 +197,17 @@ impl<S: Strategy> EngineRunner<S> {
             i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Burn the immediate-fire tick so the first summary lands
             // one interval into the run.
+            i.tick().await;
+            Some(i)
+        };
+
+        let mut timer_ticker = if self.timer_interval.is_zero() {
+            None
+        } else {
+            let mut i = tokio::time::interval(self.timer_interval);
+            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Burn the immediate tick — the first `on_timer` call
+            // should land one interval into the run, not at t=0.
             i.tick().await;
             Some(i)
         };
@@ -257,6 +287,48 @@ impl<S: Strategy> EngineRunner<S> {
                     if let Some(tx) = self.summary_tx.as_ref() {
                         let _ = tx.send(snap);
                     }
+                }
+                _ = async {
+                    match timer_ticker.as_mut() {
+                        Some(i) => { i.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Honor the kill-switch gate the same way the event
+                    // branch does — a halted engine drops timer actions
+                    // at the boundary. `Replay::tick_timer` also
+                    // short-circuits via the engine's `paused` flag, but
+                    // we mirror the explicit `set_paused` toggle here so
+                    // an out-of-band reset rearms on the very next tick.
+                    let halted = self
+                        .kill_switch
+                        .as_ref()
+                        .is_some_and(|ks| ks.tripped());
+                    self.replay.set_paused(halted);
+                    let step = self.replay.tick_timer(last_ts);
+                    if let Some(tx) = self.audit_tx.as_ref() {
+                        for r in &step.reports {
+                            if tx.send(AuditEvent::Report(r.clone())).await.is_err() {
+                                debug!("runner: audit sink closed during timer tick");
+                                self.audit_tx = None;
+                                break;
+                            }
+                        }
+                        if let Some(tx) = self.audit_tx.as_ref() {
+                            for f in &step.fills {
+                                if tx.send(AuditEvent::Fill(f.clone())).await.is_err() {
+                                    debug!("runner: audit sink closed during timer tick");
+                                    self.audit_tx = None;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.observe(&self.replay.summary());
+                    }
+                    self.evaluate_pnl_guard();
+                    self.apply_trip_sweep(last_ts).await;
                 }
             }
         }
@@ -720,6 +792,96 @@ mod tests {
         // And no stray rejected reports — the sweep only emits valid
         // cancels for real tracked cids.
         assert_eq!(summary.metrics.orders_rejected, 0);
+    }
+
+    /// Minimal strategy that fires one Cancel every time `on_timer`
+    /// runs and stays silent on every other hook. Cancel of an unknown
+    /// cid surfaces synchronously as a `Rejected` report on the paper
+    /// engine — a cheap signal the runner can assert against without
+    /// seeding the book or driving any market events.
+    struct TimerCancelOnly;
+    impl Strategy for TimerCancelOnly {
+        fn on_book_update(
+            &mut self,
+            _now: Timestamp,
+            _book: &ts_book::OrderBook,
+        ) -> Vec<ts_strategy::StrategyAction> {
+            Vec::new()
+        }
+        fn on_fill(&mut self, _fill: &ts_core::Fill) {}
+        fn on_timer(&mut self, _now: Timestamp) -> Vec<ts_strategy::StrategyAction> {
+            vec![ts_strategy::StrategyAction::Cancel(
+                ts_core::ClientOrderId::new("timer-nope"),
+            )]
+        }
+    }
+
+    fn build_timer_replay() -> Replay<TimerCancelOnly> {
+        let engine = PaperEngine::new(
+            ts_oms::EngineConfig {
+                venue: venue(),
+                symbol: sym(),
+                notional_fallback_price: None,
+            },
+            RiskConfig::permissive(),
+            TimerCancelOnly,
+        );
+        Replay::new(engine)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timer_tick_drives_on_timer_and_reaches_engine() {
+        // No market events flow through the channel — the only way
+        // orders_rejected > 0 can reach the summary is via the
+        // runner-driven timer branch calling `tick_timer` on an
+        // otherwise silent replay.
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(4);
+        let (runner, handle) = EngineRunner::new(build_timer_replay(), rx);
+        let runner = runner.with_timer_interval(Duration::from_millis(50));
+        let task = tokio::spawn(runner.run());
+
+        // Walk time past two timer ticks; the first cancel surfaces
+        // right after the first tick elapses.
+        tokio::time::sleep(Duration::from_millis(125)).await;
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+        assert!(
+            summary.metrics.orders_rejected >= 1,
+            "timer-driven cancel must surface; got {:?}",
+            summary.metrics
+        );
+        // The timer branch never ingests MarketEvents and we never
+        // sent any, so this counter proves no event was processed.
+        assert_eq!(summary.metrics.events_ingested, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn halted_runner_drops_timer_actions() {
+        use ts_risk::{KillSwitch, TripReason};
+        // Trip the kill switch before any timer tick fires. The
+        // runner's timer branch sets `replay.paused(true)` for a
+        // tripped switch, so the engine short-circuits `on_timer` and
+        // no Rejected cancels should accumulate.
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(4);
+        let ks = Arc::new(KillSwitch::default());
+        ks.trip(TripReason::Manual);
+        let (runner, handle) = EngineRunner::new(build_timer_replay(), rx);
+        let runner = runner
+            .with_timer_interval(Duration::from_millis(50))
+            .with_kill_switch(Arc::clone(&ks));
+        let task = tokio::spawn(runner.run());
+
+        // Advance past several timer intervals.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+        assert_eq!(
+            summary.metrics.orders_rejected, 0,
+            "halted runner must not tick on_timer; got {:?}",
+            summary.metrics
+        );
     }
 
     #[tokio::test]

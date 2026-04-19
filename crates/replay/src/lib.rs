@@ -158,6 +158,20 @@ impl<S: Strategy> Replay<S> {
         step
     }
 
+    /// Run the strategy's timer hook through the engine on a
+    /// runner-driven cadence, independent of market events. Used by
+    /// runners to tick time-scheduled strategies (TWAP slices,
+    /// heartbeat cancels, stale-quote pruning) even when the feed is
+    /// silent. Honors the engine's `paused` gate — a halted engine
+    /// skips `on_timer` exactly the way it skips `on_book_update`.
+    /// Idempotent: a strategy that returns no actions produces an
+    /// empty step.
+    pub fn tick_timer(&mut self, now: Timestamp) -> EngineStep {
+        let step = self.engine.apply_timer(now);
+        self.absorb_step(&step);
+        step
+    }
+
     /// Build an immutable summary of the replay so far.
     pub fn summary(&self) -> ReplaySummary {
         let symbol = &self.engine.config().symbol;
@@ -420,6 +434,77 @@ mod tests {
         let second = r.drain_shutdown(Timestamp::default());
         assert!(second.reports.is_empty());
         assert!(second.fills.is_empty());
+    }
+
+    /// Strategy that emits one Cancel the first time `on_timer` fires
+    /// and no-ops on the book path. Used to prove `Replay::tick_timer`
+    /// walks the action list through the paper engine without needing
+    /// any market events at all.
+    struct TimerCanceler {
+        target: ClientOrderId,
+        fired: bool,
+    }
+    impl Strategy for TimerCanceler {
+        fn on_book_update(
+            &mut self,
+            _now: Timestamp,
+            _book: &ts_book::OrderBook,
+        ) -> Vec<ts_strategy::StrategyAction> {
+            Vec::new()
+        }
+        fn on_fill(&mut self, _fill: &ts_core::Fill) {}
+        fn on_timer(&mut self, _now: Timestamp) -> Vec<ts_strategy::StrategyAction> {
+            if self.fired {
+                return Vec::new();
+            }
+            self.fired = true;
+            vec![ts_strategy::StrategyAction::Cancel(self.target.clone())]
+        }
+    }
+
+    #[test]
+    fn tick_timer_fans_out_to_on_timer_without_market_events() {
+        let engine = PaperEngine::new(
+            EngineConfig {
+                venue: venue(),
+                symbol: sym(),
+                notional_fallback_price: None,
+            },
+            ts_oms::RiskConfig::permissive(),
+            TimerCanceler {
+                target: ClientOrderId::new("nope"),
+                fired: false,
+            },
+        );
+        let mut r = Replay::new(engine);
+        // Cancel of an unknown cid surfaces as Rejected — that is
+        // exactly the signal we use to prove the action walked the
+        // whole chain (strategy → engine → accountant/metrics).
+        let step = r.tick_timer(Timestamp::default());
+        assert_eq!(step.reports.len(), 1);
+        assert_eq!(step.reports[0].status, OrderStatus::Rejected);
+        assert_eq!(r.metrics().orders_rejected, 1);
+    }
+
+    #[test]
+    fn tick_timer_is_gated_by_pause() {
+        let engine = PaperEngine::new(
+            EngineConfig {
+                venue: venue(),
+                symbol: sym(),
+                notional_fallback_price: None,
+            },
+            ts_oms::RiskConfig::permissive(),
+            TimerCanceler {
+                target: ClientOrderId::new("nope"),
+                fired: false,
+            },
+        );
+        let mut r = Replay::new(engine);
+        r.set_paused(true);
+        let step = r.tick_timer(Timestamp::default());
+        assert!(step.reports.is_empty());
+        assert_eq!(r.metrics().orders_rejected, 0);
     }
 
     #[test]

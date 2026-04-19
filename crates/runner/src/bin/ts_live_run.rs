@@ -83,6 +83,11 @@ struct Cli {
     #[arg(long)]
     channel: Option<usize>,
 
+    /// Cadence at which the runner fires `Strategy::on_timer`, in
+    /// milliseconds. Omit (or pass zero) to disable the timer tick.
+    #[arg(long)]
+    timer_ms: Option<u64>,
+
     #[arg(long)]
     rest_base: Option<String>,
 
@@ -191,6 +196,9 @@ fn resolve_config(cli: &Cli) -> Result<LiveCfg> {
     }
     if let Some(v) = cli.channel {
         cfg.runner.channel = v;
+    }
+    if let Some(v) = cli.timer_ms {
+        cfg.runner.timer_ms = if v == 0 { None } else { Some(v) };
     }
     if let Some(v) = cli.rest_base.clone() {
         cfg.binance.rest_base = v;
@@ -333,6 +341,9 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     let summary_interval = Duration::from_secs(cfg.runner.summary_secs);
     if !summary_interval.is_zero() {
         builder = builder.summary_tap(summary_interval, 8);
+    }
+    if let Some(ms) = cfg.runner.timer_ms {
+        builder = builder.timer_interval(Duration::from_millis(ms));
     }
 
     let (kill_switch, halt_watcher) = wire_kill_switch(cfg.kill_switch.as_ref());
