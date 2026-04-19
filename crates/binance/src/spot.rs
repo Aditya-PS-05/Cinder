@@ -31,16 +31,31 @@
 //! planet reconnects at the same deterministic interval, their
 //! retries collide. Spreading each client's retry across
 //! `[base*(1-r), base*(1+r)]` de-synchronises the herd.
+//!
+//! ## Health probe
+//!
+//! A half-open TCP can silently stall the WS for minutes before the
+//! kernel notices and closes the socket — during that window the
+//! client *looks* connected but no frames arrive. [`HealthProbe`] is
+//! the silence-watchdog that shortcircuits this: after
+//! [`SpotStreamConfig::silence_timeout`] with no inbound activity the
+//! session sends a WS Ping, and if no frame at all arrives within
+//! [`SpotStreamConfig::pong_timeout`] of that Ping, the session bails
+//! with [`BinanceError::Align`] so the outer reconnect loop starts a
+//! fresh snapshot. Every Pong resets the probe and records an RTT
+//! sample into [`SpotStreamClient::last_ping_rtt_ms`] for metrics —
+//! operators can watch that gauge to see the WS leg's latency
+//! distribution in steady state.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::SinkExt;
 use serde_json::json;
-use tokio::time::sleep;
+use tokio::time::{interval, sleep, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
@@ -81,6 +96,17 @@ pub struct SpotStreamConfig {
     /// `base`, large enough to de-correlate thousands of clients
     /// retrying after a shared outage.
     pub jitter_ratio: f64,
+    /// Idle time after which the session sends a WS Ping to probe the
+    /// connection. Defaults to 30s — Binance streams typically emit
+    /// something at least every 100ms, so 30s of silence is already
+    /// strong evidence the TCP has half-opened. Set [`Duration::ZERO`]
+    /// to disable the health probe entirely.
+    pub silence_timeout: Duration,
+    /// Grace period between sending a Ping and giving up on the
+    /// session. If no frame (Pong *or* data) arrives within this
+    /// window the session returns [`BinanceError::Align`] so the
+    /// outer loop reconnects with a fresh snapshot. Defaults to 10s.
+    pub pong_timeout: Duration,
 }
 
 impl SpotStreamConfig {
@@ -93,8 +119,128 @@ impl SpotStreamConfig {
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             jitter_ratio: 0.2,
+            silence_timeout: Duration::from_secs(30),
+            pong_timeout: Duration::from_secs(10),
         }
     }
+}
+
+/// Action the session loop should take on a probe tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeAction {
+    /// Connection looks alive; do nothing this tick.
+    Idle,
+    /// Session has been silent for [`SpotStreamConfig::silence_timeout`].
+    /// Caller should emit a WS Ping.
+    SendPing,
+    /// A Ping was sent but nothing came back within
+    /// [`SpotStreamConfig::pong_timeout`]. Caller should abort the
+    /// session and force reconnect.
+    GiveUp,
+}
+
+/// Pure state machine for the WS silence watchdog. Owns no I/O; the
+/// session loop feeds it activity notifications and probe ticks and
+/// acts on the returned [`ProbeAction`]. Factored out so the timing
+/// math can be unit-tested without a live WebSocket.
+///
+/// Behaviour:
+///
+/// * [`HealthProbe::note_activity`] is called on *any* inbound frame
+///   (data, Ping, Pong, Close). It resets the silence clock and
+///   clears any in-flight ping, capturing the round-trip time into
+///   the shared `last_rtt_ms` gauge if a Ping was outstanding.
+/// * [`HealthProbe::poll`] is called on the probe tick. If a ping
+///   is already in flight and [`SpotStreamConfig::pong_timeout`] has
+///   elapsed without any activity, it returns [`ProbeAction::GiveUp`].
+///   Otherwise, if silence has exceeded
+///   [`SpotStreamConfig::silence_timeout`] with no ping in flight,
+///   it marks one as sent and returns [`ProbeAction::SendPing`].
+/// * A [`SpotStreamConfig::silence_timeout`] of [`Duration::ZERO`]
+///   disables the probe: `poll` always returns
+///   [`ProbeAction::Idle`].
+#[derive(Debug)]
+pub(crate) struct HealthProbe {
+    silence_timeout: Duration,
+    pong_timeout: Duration,
+    last_activity: Instant,
+    ping_sent_at: Option<Instant>,
+    last_rtt_ms: Arc<AtomicU64>,
+}
+
+impl HealthProbe {
+    pub(crate) fn new(
+        silence_timeout: Duration,
+        pong_timeout: Duration,
+        now: Instant,
+        last_rtt_ms: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            silence_timeout,
+            pong_timeout,
+            last_activity: now,
+            ping_sent_at: None,
+            last_rtt_ms,
+        }
+    }
+
+    /// Record an inbound frame. Clears any outstanding ping and, if
+    /// one was in flight, folds the round-trip time into the shared
+    /// gauge.
+    pub(crate) fn note_activity(&mut self, now: Instant) {
+        if let Some(sent) = self.ping_sent_at.take() {
+            let rtt = now.saturating_duration_since(sent);
+            let rtt_ms = rtt.as_millis().min(u64::MAX as u128) as u64;
+            self.last_rtt_ms.store(rtt_ms, Ordering::Relaxed);
+        }
+        self.last_activity = now;
+    }
+
+    /// Evaluate whether the caller should take an action this tick.
+    /// Returns [`ProbeAction::Idle`] when the probe is disabled
+    /// (`silence_timeout == 0`) or the connection looks alive.
+    pub(crate) fn poll(&mut self, now: Instant) -> ProbeAction {
+        if self.silence_timeout.is_zero() {
+            return ProbeAction::Idle;
+        }
+        if let Some(sent) = self.ping_sent_at {
+            if now.saturating_duration_since(sent) >= self.pong_timeout {
+                return ProbeAction::GiveUp;
+            }
+            return ProbeAction::Idle;
+        }
+        if now.saturating_duration_since(self.last_activity) >= self.silence_timeout {
+            self.ping_sent_at = Some(now);
+            return ProbeAction::SendPing;
+        }
+        ProbeAction::Idle
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ping_in_flight(&self) -> bool {
+        self.ping_sent_at.is_some()
+    }
+}
+
+/// Pure: choose how often [`HealthProbe::poll`] should tick given the
+/// configured silence/pong windows. We want the probe to respond
+/// quickly enough that a half-open TCP is caught close to the
+/// silence deadline (so ~`silence_timeout / 4`), but also not to
+/// oversleep past the pong deadline once a ping is in flight. A
+/// zero `silence_timeout` disables the probe; we still return a
+/// long, harmless cadence because the tick branch is always selected
+/// by the session loop and a zero-duration interval would fire in a
+/// tight loop. The floor of 100ms keeps the cost of the branch
+/// negligible on a healthy connection.
+pub(crate) fn probe_tick_period(silence_timeout: Duration, pong_timeout: Duration) -> Duration {
+    if silence_timeout.is_zero() {
+        // Probe disabled: pick something that won't fire spuriously.
+        return Duration::from_secs(60);
+    }
+    let quarter_silence = silence_timeout / 4;
+    let cap = pong_timeout.max(Duration::from_millis(1));
+    let floor = Duration::from_millis(100);
+    quarter_silence.min(cap).max(floor)
 }
 
 /// Pure: scale `base` by `(1 - ratio) + 2 * ratio * rand_01` so the
@@ -160,6 +306,12 @@ pub struct SpotStreamClient {
     /// long-run rate of desync events on a feed; the outer reconnect
     /// loop reuses the same counter via [`Self::resync_counter`].
     resync_counter: Arc<AtomicU64>,
+    /// Most recent WS Ping → reply round-trip time in milliseconds.
+    /// Updated by [`HealthProbe::note_activity`] whenever an inbound
+    /// frame arrives while a ping is in flight; persists across
+    /// reconnect cycles. Exposed via [`Self::last_ping_rtt_ms`] for
+    /// metrics scrapers.
+    last_ping_rtt_ms: Arc<AtomicU64>,
 }
 
 impl SpotStreamClient {
@@ -168,6 +320,7 @@ impl SpotStreamClient {
             cfg,
             bus,
             resync_counter: Arc::new(AtomicU64::new(0)),
+            last_ping_rtt_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -185,6 +338,24 @@ impl SpotStreamClient {
     /// without holding a reference to the client.
     pub fn resync_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.resync_counter)
+    }
+
+    /// Most recent WS Ping → reply round-trip time, in milliseconds.
+    /// Zero until the first ping completes; updated every time the
+    /// session sends a Ping and receives any frame back. Exposed as a
+    /// single scalar rather than a histogram because the silence
+    /// watchdog only fires when the feed is quiet — the RTT is
+    /// therefore a point observation, not a stream.
+    pub fn last_ping_rtt_ms(&self) -> u64 {
+        self.last_ping_rtt_ms.load(Ordering::Relaxed)
+    }
+
+    /// Shared handle to the ping-RTT gauge so a metrics endpoint can
+    /// publish the value without holding a reference to the client.
+    /// Mirrors [`Self::resync_counter`] so observers can take handles
+    /// to both on construction.
+    pub fn last_ping_rtt_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.last_ping_rtt_ms)
     }
 
     /// Run the reconnect loop forever. Returns only if the caller aborts
@@ -221,6 +392,21 @@ impl SpotStreamClient {
     async fn session(&self) -> Result<(), BinanceError> {
         info!(url = %self.cfg.ws_url, "connecting to binance spot");
         let (mut ws, _resp) = connect_async(&self.cfg.ws_url).await?;
+        let mut probe = HealthProbe::new(
+            self.cfg.silence_timeout,
+            self.cfg.pong_timeout,
+            Instant::now(),
+            Arc::clone(&self.last_ping_rtt_ms),
+        );
+        // Tick the probe four times per silence window so a half-open
+        // TCP is caught within ~silence_timeout/4. Never faster than
+        // 100ms (no need to hammer a probe on a healthy connection),
+        // never slower than the pong grace so a stuck ping isn't
+        // missed. A zero silence_timeout disables the probe; use a
+        // harmless long cadence so the branch is never selected.
+        let probe_period = probe_tick_period(self.cfg.silence_timeout, self.cfg.pong_timeout);
+        let mut probe_tick = interval(probe_period);
+        probe_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         // Single combined subscribe request. Each symbol gets trades +
         // 100ms depth; that's enough to prove the pipeline end to end.
@@ -276,6 +462,7 @@ impl SpotStreamClient {
                 biased;
                 maybe_frame = ws.next() => {
                     let Some(frame) = maybe_frame else { break; };
+                    probe.note_activity(Instant::now());
                     match frame? {
                         Message::Text(t) => self.handle_payload(t.as_bytes(), &mut resyncs)?,
                         Message::Binary(b) => self.handle_payload(&b, &mut resyncs)?,
@@ -293,6 +480,28 @@ impl SpotStreamClient {
                 Some((sym, snap_res)) = snapshot_fetches.next(), if !snapshot_fetches.is_empty() => {
                     let snap = snap_res?;
                     self.install_snapshot(sym, snap, &mut resyncs)?;
+                }
+                _ = probe_tick.tick() => {
+                    match probe.poll(Instant::now()) {
+                        ProbeAction::Idle => {}
+                        ProbeAction::SendPing => {
+                            debug!("ws silence watchdog firing ping");
+                            ws.send(Message::Ping(Vec::new())).await?;
+                        }
+                        ProbeAction::GiveUp => {
+                            warn!(
+                                silence_timeout_ms = self.cfg.silence_timeout.as_millis() as u64,
+                                pong_timeout_ms = self.cfg.pong_timeout.as_millis() as u64,
+                                "ws ping unanswered; forcing reconnect"
+                            );
+                            return Err(BinanceError::Align {
+                                detail: format!(
+                                    "ws silent for {:?} and ping unanswered within {:?}",
+                                    self.cfg.silence_timeout, self.cfg.pong_timeout,
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -671,5 +880,190 @@ mod tests {
         let cfg = SpotStreamConfig::new(vec!["BTCUSDT".into()], HashMap::new());
         assert!(cfg.jitter_ratio > 0.0);
         assert!(cfg.jitter_ratio <= 1.0);
+    }
+
+    /// Default config enables the health probe with a non-zero
+    /// silence window and a pong grace strictly smaller than silence.
+    /// Both guarantees are load-bearing: a zero silence disables the
+    /// probe entirely, and a pong window >= silence lets a stuck
+    /// session wait two full silence cycles before giving up.
+    #[test]
+    fn default_config_ships_with_health_probe_enabled() {
+        let cfg = SpotStreamConfig::new(vec!["BTCUSDT".into()], HashMap::new());
+        assert!(!cfg.silence_timeout.is_zero(), "probe disabled by default");
+        assert!(!cfg.pong_timeout.is_zero(), "pong timeout must be positive");
+        assert!(
+            cfg.pong_timeout < cfg.silence_timeout,
+            "pong grace should be shorter than silence window"
+        );
+    }
+
+    /// Within the silence window, `poll` is a no-op. The session loop
+    /// must not send spurious pings while frames are flowing (even if
+    /// the tick fires frequently), otherwise a healthy connection
+    /// would emit Pings every tick.
+    #[test]
+    fn health_probe_is_idle_while_within_silence_window() {
+        let gauge = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let mut p = HealthProbe::new(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            t0,
+            Arc::clone(&gauge),
+        );
+        // No activity, small elapsed time → still idle.
+        assert_eq!(p.poll(t0 + Duration::from_secs(5)), ProbeAction::Idle);
+        assert!(!p.ping_in_flight());
+    }
+
+    /// Past the silence threshold with no ping in flight, the probe
+    /// asks for a Ping and flips into `ping_in_flight`. A second poll
+    /// without any intervening activity must stay Idle (don't spam
+    /// pings while one is outstanding).
+    #[test]
+    fn health_probe_sends_one_ping_when_silence_expires() {
+        let gauge = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let mut p = HealthProbe::new(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            t0,
+            Arc::clone(&gauge),
+        );
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(p.poll(t1), ProbeAction::SendPing);
+        assert!(p.ping_in_flight());
+        // A follow-up poll *before* the pong deadline must not
+        // issue another ping.
+        let t2 = t1 + Duration::from_secs(5);
+        assert_eq!(p.poll(t2), ProbeAction::Idle);
+    }
+
+    /// Once the pong deadline lapses with no inbound frame, the
+    /// probe asks the caller to abort the session. This is the whole
+    /// point of the watchdog — the kernel may still think the TCP is
+    /// fine, but the exchange is silent, so reconnect forcibly.
+    #[test]
+    fn health_probe_gives_up_after_pong_deadline() {
+        let gauge = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let mut p = HealthProbe::new(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            t0,
+            Arc::clone(&gauge),
+        );
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(p.poll(t1), ProbeAction::SendPing);
+        let t2 = t1 + Duration::from_secs(11);
+        assert_eq!(p.poll(t2), ProbeAction::GiveUp);
+    }
+
+    /// Any inbound frame satisfies the silence check, *and* completes
+    /// an outstanding ping by recording the round-trip time into the
+    /// shared gauge. Data flowing means the connection is alive —
+    /// we must not reconnect just because our synthetic Pong didn't
+    /// come back specifically.
+    #[test]
+    fn health_probe_activity_clears_ping_and_records_rtt() {
+        let gauge = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let mut p = HealthProbe::new(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            t0,
+            Arc::clone(&gauge),
+        );
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(p.poll(t1), ProbeAction::SendPing);
+
+        let t2 = t1 + Duration::from_millis(42);
+        p.note_activity(t2);
+        assert!(!p.ping_in_flight());
+        assert_eq!(gauge.load(Ordering::Relaxed), 42);
+
+        // Right after activity, the probe must not fire another ping
+        // even after a full silence cycle — the window resets.
+        let t3 = t2 + Duration::from_secs(5);
+        assert_eq!(p.poll(t3), ProbeAction::Idle);
+    }
+
+    /// A `silence_timeout` of zero disables the watchdog entirely.
+    /// Operators who want to lean on the TCP stack alone should see
+    /// no synthetic pings and no reconnects from the probe, even on
+    /// an arbitrarily long silence.
+    #[test]
+    fn health_probe_with_zero_silence_is_disabled() {
+        let gauge = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let mut p = HealthProbe::new(
+            Duration::ZERO,
+            Duration::from_secs(10),
+            t0,
+            Arc::clone(&gauge),
+        );
+        let t1 = t0 + Duration::from_secs(3_600);
+        assert_eq!(p.poll(t1), ProbeAction::Idle);
+        assert!(!p.ping_in_flight());
+    }
+
+    /// Activity recorded without any ping in flight must leave the
+    /// gauge unchanged. The RTT gauge is only meaningful when a ping
+    /// was actually outstanding; writing 0 on every frame would
+    /// pollute the metric with noise.
+    #[test]
+    fn health_probe_activity_without_ping_does_not_touch_rtt_gauge() {
+        let gauge = Arc::new(AtomicU64::new(123));
+        let t0 = Instant::now();
+        let mut p = HealthProbe::new(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            t0,
+            Arc::clone(&gauge),
+        );
+        p.note_activity(t0 + Duration::from_secs(1));
+        assert_eq!(gauge.load(Ordering::Relaxed), 123);
+    }
+
+    /// Tick cadence calibration: with the defaults the session polls
+    /// roughly silence_timeout/4 or the pong grace, whichever is
+    /// smaller, floored at 100ms.
+    #[test]
+    fn probe_tick_period_tracks_silence_and_pong_windows() {
+        // 30s silence → ~7.5s cadence; 10s pong → cap at 7.5s (the
+        // smaller), then no floor.
+        assert_eq!(
+            probe_tick_period(Duration::from_secs(30), Duration::from_secs(10)),
+            Duration::from_millis(7_500)
+        );
+        // Aggressive pong < silence/4 → cadence caps at pong.
+        assert_eq!(
+            probe_tick_period(Duration::from_secs(60), Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        // Floor kicks in for tiny silence values so we don't spin.
+        assert_eq!(
+            probe_tick_period(Duration::from_millis(100), Duration::from_secs(10)),
+            Duration::from_millis(100)
+        );
+        // Zero silence disables the probe; cadence is a long, safe
+        // constant so the tick branch is rarely selected.
+        assert_eq!(
+            probe_tick_period(Duration::ZERO, Duration::from_secs(10)),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// `last_ping_rtt_ms` starts at zero and is shared across handles
+    /// so a metrics task holding the `Arc` sees the same value the
+    /// client does.
+    #[test]
+    fn spot_client_exposes_shared_ping_rtt_gauge() {
+        let c = client();
+        assert_eq!(c.last_ping_rtt_ms(), 0);
+        let handle = c.last_ping_rtt_handle();
+        handle.store(17, Ordering::Relaxed);
+        assert_eq!(c.last_ping_rtt_ms(), 17);
     }
 }
