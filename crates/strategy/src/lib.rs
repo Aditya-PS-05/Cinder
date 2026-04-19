@@ -33,12 +33,22 @@ pub enum StrategyAction {
 /// and [`Self::on_exec_report`] propagate execution feedback so the
 /// strategy can track inventory and clear references to orders that
 /// have reached a terminal state.
+///
+/// [`Self::on_shutdown`] runs once when the runner is winding down.
+/// Strategies that hold live orders should return `Cancel` actions for
+/// each one so the venue does not retain open quotes after the process
+/// exits. The default is empty for strategies that don't track live
+/// state (e.g. pure analytics).
 pub trait Strategy: Send {
     fn on_book_update(&mut self, now: Timestamp, book: &OrderBook) -> Vec<StrategyAction>;
 
     fn on_fill(&mut self, fill: &Fill);
 
     fn on_exec_report(&mut self, _report: &ExecReport) {}
+
+    fn on_shutdown(&mut self) -> Vec<StrategyAction> {
+        Vec::new()
+    }
 }
 
 /// Forwarding impl so callers can own a strategy behind a trait object
@@ -52,6 +62,9 @@ impl Strategy for Box<dyn Strategy> {
     }
     fn on_exec_report(&mut self, report: &ExecReport) {
         (**self).on_exec_report(report)
+    }
+    fn on_shutdown(&mut self) -> Vec<StrategyAction> {
+        (**self).on_shutdown()
     }
 }
 

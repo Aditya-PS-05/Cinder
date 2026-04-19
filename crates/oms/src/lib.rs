@@ -127,6 +127,16 @@ impl<S: Strategy> PaperEngine<S> {
         Ok(self.process_actions(actions, event.local_ts))
     }
 
+    /// Drive the strategy's shutdown hook and run every returned action
+    /// through the engine. Used by runners to cancel open quotes before
+    /// exiting so the venue does not retain stale orders across a
+    /// process restart. Idempotent: if the strategy has nothing to
+    /// cancel the returned step is empty.
+    pub fn drain_shutdown(&mut self, now: Timestamp) -> EngineStep {
+        let actions = self.strategy.on_shutdown();
+        self.process_actions(actions, now)
+    }
+
     fn process_actions(&mut self, actions: Vec<StrategyAction>, now: Timestamp) -> EngineStep {
         let mut step = EngineStep::default();
         for action in actions {

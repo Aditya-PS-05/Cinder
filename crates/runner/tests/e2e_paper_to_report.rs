@@ -161,6 +161,15 @@ async fn paper_runner_pipeline_produces_audit_tape_that_ts_report_can_parse() {
         report.statuses.new >= 2,
         "every maker quote lands as OrderStatus::New"
     );
+    // The runner's shutdown sweep should have cancelled every open
+    // quote on its way out — so the audit tape must end with at least
+    // two Canceled reports. This is the contract live trading relies
+    // on so no orders are left resting on the venue.
+    assert!(
+        report.statuses.canceled >= 2,
+        "graceful shutdown should cancel both open quotes (got {})",
+        report.statuses.canceled
+    );
 
     // No fills means no quant series; the derived metrics must stay
     // unset rather than report synthetic zeroes.

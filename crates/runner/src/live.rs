@@ -27,7 +27,7 @@ use tokio::sync::{broadcast, mpsc, Notify};
 use tracing::{debug, error, warn};
 
 use ts_book::OrderBook;
-use ts_core::{ExecReport, Fill, MarketEvent, MarketPayload};
+use ts_core::{ExecReport, Fill, MarketEvent, MarketPayload, Timestamp};
 use ts_oms::OrderEngine;
 use ts_risk::KillSwitch;
 use ts_strategy::{Strategy, StrategyAction};
@@ -133,6 +133,10 @@ impl<E: OrderEngine> LiveRunner<E> {
             Some(i)
         };
 
+        // Track the most recent event timestamp so shutdown-sweep
+        // cancels can be stamped consistently with the event stream.
+        let mut last_ts = Timestamp::default();
+
         loop {
             tokio::select! {
                 biased;
@@ -145,6 +149,7 @@ impl<E: OrderEngine> LiveRunner<E> {
                         debug!("live-runner: event channel closed");
                         break;
                     };
+                    last_ts = event.local_ts;
                     if let Some(m) = self.metrics.as_ref() {
                         m.observe_event(&event);
                     }
@@ -166,10 +171,40 @@ impl<E: OrderEngine> LiveRunner<E> {
             }
         }
 
+        // Cancel any quotes the strategy still holds. Without this the
+        // venue keeps resting orders across a process restart, which is
+        // exactly the failure mode a trader most wants to avoid.
+        self.drain_strategy_shutdown(last_ts).await;
+
         // One last reconcile so anything that landed between the final
-        // event and shutdown isn't lost.
+        // event and shutdown (including the cancels above) isn't lost.
         self.drain_reconcile().await;
         self.summary.clone()
+    }
+
+    async fn drain_strategy_shutdown(&mut self, now: Timestamp) {
+        let actions = self.strategy.on_shutdown();
+        for action in actions {
+            match action {
+                StrategyAction::Cancel(cid) => match self.engine.cancel(&cid) {
+                    Ok(report) => self.observe_report(report).await,
+                    Err(err) => {
+                        error!(error = %err, "live-runner: shutdown cancel failed");
+                        self.summary.reconcile_errors += 1;
+                    }
+                },
+                StrategyAction::Place(order) => {
+                    self.summary.orders_submitted += 1;
+                    match self.engine.submit(order, now) {
+                        Ok(report) => self.observe_report(report).await,
+                        Err(err) => {
+                            error!(error = %err, "live-runner: shutdown submit failed");
+                            self.summary.reconcile_errors += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn handle_market_event(&mut self, event: MarketEvent) {

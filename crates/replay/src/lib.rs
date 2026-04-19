@@ -136,6 +136,16 @@ impl<S: Strategy> Replay<S> {
         report
     }
 
+    /// Run the strategy's shutdown sweep through the engine, folding
+    /// every resulting report and fill into metrics + accountant.
+    /// Returns the step so callers (typically a runner) can forward
+    /// its reports and fills to an audit sink.
+    pub fn drain_shutdown(&mut self, now: Timestamp) -> EngineStep {
+        let step = self.engine.drain_shutdown(now);
+        self.absorb_step(&step);
+        step
+    }
+
     /// Build an immutable summary of the replay so far.
     pub fn summary(&self) -> ReplaySummary {
         let symbol = &self.engine.config().symbol;
@@ -366,6 +376,36 @@ mod tests {
         assert!(m.fills >= 2);
         assert_eq!(m.gross_filled_qty, 5);
         assert_eq!(m.gross_notional, 110 * 3 + 110 * 2);
+    }
+
+    #[test]
+    fn drain_shutdown_cancels_the_makers_open_quotes() {
+        let mut r = Replay::new(engine());
+        // First tick places two quotes.
+        r.step(&snapshot(vec![lvl(100, 10)], vec![lvl(110, 10)], 1))
+            .unwrap();
+        let before = r.metrics().clone();
+        assert_eq!(before.orders_new, 2);
+        assert_eq!(before.orders_canceled, 0);
+
+        let step = r.drain_shutdown(Timestamp::default());
+        // The shutdown sweep should emit exactly two Canceled reports,
+        // one per live quote. No fills.
+        assert_eq!(step.reports.len(), 2);
+        assert!(step.fills.is_empty());
+        for report in &step.reports {
+            assert_eq!(report.status, OrderStatus::Canceled);
+        }
+
+        let after = r.metrics();
+        assert_eq!(after.orders_canceled, before.orders_canceled + 2);
+        assert_eq!(after.orders_submitted, before.orders_submitted + 2);
+
+        // A second sweep is a no-op — the strategy has cleared its
+        // tracked cids and has nothing more to cancel.
+        let second = r.drain_shutdown(Timestamp::default());
+        assert!(second.reports.is_empty());
+        assert!(second.fills.is_empty());
     }
 
     #[test]

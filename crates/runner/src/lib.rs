@@ -29,7 +29,7 @@ use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::{debug, warn};
 
-use ts_core::{bus::Subscription, MarketEvent};
+use ts_core::{bus::Subscription, MarketEvent, Timestamp};
 use ts_replay::{Replay, ReplaySummary};
 use ts_strategy::Strategy;
 
@@ -143,6 +143,10 @@ impl<S: Strategy> EngineRunner<S> {
             Some(i)
         };
 
+        // Most recent event timestamp seen; stamped onto cancels emitted
+        // by the shutdown sweep so the audit tape stays monotonic.
+        let mut last_ts = Timestamp::default();
+
         loop {
             tokio::select! {
                 biased;
@@ -155,6 +159,7 @@ impl<S: Strategy> EngineRunner<S> {
                         debug!("runner: event channel closed");
                         break;
                     };
+                    last_ts = event.local_ts;
                     if let Some(m) = self.metrics.as_ref() {
                         m.observe_event(&event);
                     }
@@ -205,6 +210,19 @@ impl<S: Strategy> EngineRunner<S> {
                 }
             }
         }
+        // Clean up any open quotes the strategy still holds. For the
+        // paper engine this is bookkeeping; on a live venue it matters
+        // — the process is leaving, the quotes should leave with it.
+        let cleanup = self.replay.drain_shutdown(last_ts);
+        if let Some(tx) = self.audit_tx.as_ref() {
+            for r in &cleanup.reports {
+                if tx.send(AuditEvent::Report(r.clone())).await.is_err() {
+                    debug!("runner: audit sink closed during shutdown sweep");
+                    break;
+                }
+            }
+        }
+
         let final_summary = self.replay.summary();
         if let Some(m) = self.metrics.as_ref() {
             m.observe(&final_summary);

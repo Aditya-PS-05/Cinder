@@ -182,6 +182,17 @@ impl Strategy for InventorySkewMaker {
             self.open_ask = None;
         }
     }
+
+    fn on_shutdown(&mut self) -> Vec<StrategyAction> {
+        let mut actions = Vec::new();
+        if let Some(cid) = self.open_bid.take() {
+            actions.push(StrategyAction::Cancel(cid));
+        }
+        if let Some(cid) = self.open_ask.take() {
+            actions.push(StrategyAction::Cancel(cid));
+        }
+        actions
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +457,32 @@ mod tests {
         };
         m.on_exec_report(&report);
         assert!(m.open_bid().is_some());
+    }
+
+    #[test]
+    fn on_shutdown_returns_cancels_for_both_open_quotes() {
+        let mut m = InventorySkewMaker::new(cfg());
+        let book = book_with(vec![lvl(100, 1)], vec![lvl(110, 1)]);
+        m.on_book_update(Timestamp::default(), &book);
+        assert!(m.open_bid().is_some());
+        assert!(m.open_ask().is_some());
+
+        let actions = m.on_shutdown();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], StrategyAction::Cancel(_)));
+        assert!(matches!(actions[1], StrategyAction::Cancel(_)));
+        // State cleared so a second sweep is a no-op — important for
+        // runners that may wind down more than once in pathological
+        // tests or if shutdown signals race.
+        assert!(m.open_bid().is_none());
+        assert!(m.open_ask().is_none());
+        assert!(m.on_shutdown().is_empty());
+    }
+
+    #[test]
+    fn on_shutdown_is_noop_when_no_open_quotes() {
+        let mut m = InventorySkewMaker::new(cfg());
+        assert!(m.on_shutdown().is_empty());
     }
 
     #[test]
