@@ -9,3 +9,6 @@ publish.workspace = true
 
 [dependencies]
 ts-core.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }

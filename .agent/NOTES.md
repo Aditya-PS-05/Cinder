@@ -1,84 +1,82 @@
 # Cinder build notes
 
 ## Current phase (2026-04-19)
-Add FIFO tax-lot accounting to ts-pnl alongside the existing WAC
-`Accountant`. Closes section 8's P0 "Realized vs unrealized
-split, FIFO tax lots" — the split itself already shipped with the
-WAC accountant; FIFO lots were the missing half.
+Property-based tests on the OrderStatus state machine and both PnL
+accountants (`ts_pnl::Accountant` WAC + `ts_pnl::LotAccountant` FIFO).
+Closes section 11's P0 "Property tests (`rapid` / `proptest`) on
+state machines and math".
 
 ## What shipped this phase
-- New `ts-pnl::tax_lots` module exporting `LotAccountant`,
-  `LotBook`, `TaxLot`, `ClosedLot`. Public API surface mirrors
-  the WAC `Accountant` (`on_fill`, `position`, `realized`,
-  `realized_net`, `fees`, `unrealized`, `iter`) so a runner can
-  swap accounting models without touching anything else.
-- FIFO semantics: every opening fill enqueues a lot;
-  opposing fills consume the oldest lot first, producing one
-  `ClosedLot { opened_side, qty, entry, exit, opened, closed,
-  realized }` per matched slice. Overshoot on an opposing fill
-  drains the queue, flips the side, and enqueues the remainder
-  as a fresh lot at the fill price.
-- `LotAccountant::on_fill` returns the `Vec<ClosedLot>` realized
-  by that fill so the runner can stream tax-lot events without a
-  second diff against `closed_lots()`.
-- Quote-denominated commissions accumulate on `LotBook::fees`
-  the same way the WAC accountant tracks them. Cross-asset
-  commissions (fee=0, non-quote label) are preserved on the
-  `Fill` but skipped by both accountants — converting them to
-  quote is out of scope for pnl.
-- 16 unit tests: opens, extensions (separate lots, no blending),
-  partial close, multi-lot close via overflow, exact close,
-  flip-with-remainder, short-side realize on both lower and
-  higher buybacks, per-lot unrealized for long and short queues,
-  per-symbol unrealized_total, closed-lot timestamps preserved,
-  fee accumulation, cross-asset fee ignored, zero-qty +
-  Unknown-side noops, FIFO-vs-WAC identity on single-cycle
-  round trips. All pass; full workspace test + clippy green.
+- `proptest = "1"` added to `[workspace.dependencies]` (std only, no
+  default features) and threaded into `ts-core` + `ts-pnl` as a
+  `[dev-dependencies]` entry. Kept opt-in so non-test crates stay
+  lean.
+- `crates/core/tests/proptest_order_status.rs` (7 properties) nails
+  the `OrderStatus` transition graph from every angle — pair-level
+  agreement between `can_transition_to` and `try_transition_to`,
+  conformance with a hand-rolled spec, self-edges, terminal
+  absorption, `New` unreachability, `Rejected` only reachable from
+  `New`, and a random-legal-walk that gets trapped at the first
+  terminal it hits.
+- `crates/pnl/tests/proptest_accountant.rs` (9 properties) on both
+  the WAC `Accountant` and the FIFO `LotAccountant`:
+  * `realized_net = realized − fees` per symbol and in total.
+  * `realized_total == Σ realized(sym)`, `fees_total == Σ fees(sym)`.
+  * FIFO queue stays homogeneous-by-side after any stream.
+  * `|position|` in FIFO equals Σ lot qty, signed by front lot.
+  * WAC and FIFO agree on signed position on every stream.
+  * Σ `closed_lot.realized` == `LotBook::realized` at every step.
+  * Extension-only streams keep realized at 0; position == Σ
+    signed qty.
+  * FIFO realizes the closed-form `Σ (exit − entry_i) · qty_i`
+    exactly on a full close of a multi-lot same-side stack.
+  * WAC matches FIFO bit-for-bit only when every open lot shares
+    a single price (i.e. no `avg_entry` truncation).
+  * FIFO `unrealized(mark) = 0` for any mark once flat.
 
 ## Design calls
-- **Additive, not replacement.** The runner, risk guard, report,
-  and metrics all hinge on the WAC `Accountant`. Keeping FIFO
-  side-by-side means nothing upstream has to change this phase;
-  a later phase can add a `--pnl-mode=fifo` runtime switch if
-  the research/tax desk actually needs FIFO gauges live.
-- **No automatic averaging on extension.** Same-side fills
-  always enqueue as distinct lots so the closed-lot history is
-  tax-lot-grade (one buy = one acquired lot). WAC is the
-  alternative for anyone who wants blended cost basis.
-- **Closed-lot emission on realization, not on close-all.** Every
-  opposing slice is its own `ClosedLot`. A Sell of 12 against
-  two Buy lots of 10+10 emits two ClosedLots (10 @ lot1, 2 @
-  lot2). This matches 8949's "acquired/disposed per lot" model.
-- **Position + side derivation from queue, not a separate
-  field.** `LotBook::position()` sums `qty` across open lots and
-  signs by front lot's side. Invariant: queue is homogeneous in
-  side or empty; `apply_fill` enforces it by draining before
-  flipping. A `debug_assert!` catches accidental interleave.
-- **Cross-asset fees: skip silently.** Matches the WAC
-  accountant's contract. A future conversion pass can walk
-  `Fill.fee_asset` against a rate oracle — parked until
-  someone actually needs cross-asset PnL accuracy.
+- **Restrict to Buy/Sell in generators.** `Side::Unknown` is a
+  sentinel the accountants intentionally drop, so properties over
+  it degenerate to "nothing happens" and add no coverage. The
+  property-test `arb_side` excludes it outright.
+- **Bound mantissa ranges in the generator.** Prices `1..10_000`,
+  qtys `1..1000`, up to 32 fills — stays well inside i128 for any
+  product `price * qty`. Keeps shrinkers producing readable minimal
+  cases rather than diagnosing overflow panics.
+- **Don't claim WAC == FIFO in general.** The *first* version of
+  the multi-lot full-close property did claim that, and proptest
+  immediately shrank to Buy (1,1) + Buy (2,1) + Sell (2) @ 1,
+  exposing the ½-unit truncation on `avg_entry = (1+2)/2 = 1`.
+  That's real behavior, not a regression — WAC trades absolute
+  correctness for O(1) state. The property now pins FIFO to the
+  closed-form exact value and keeps a separate same-price property
+  for the regime where WAC must match.
+- **Tight case counts (96–128).** Sample space is small (36 pairs
+  for OrderStatus, ≤ 32-step streams for accountants) and the
+  properties are deterministic, so 256 (proptest default) buys
+  nothing. 96 runs the whole suite in ~60 ms.
+- **External `tests/` dir, not `#[cfg(test)] mod`.** Keeps the
+  proptest dep out of the regular compile graph — it only gets
+  pulled in when actually running tests.
 
 ## Follow-ups
-- Surface FIFO metrics through the runner: `ts_fifo_realized`,
-  `ts_fifo_unrealized`, `ts_fifo_open_lots`. Needs a config
-  switch + a second Accountant instance in EngineRunner /
-  LiveRunner. Kept out of this phase to stay tight.
-- Report crate: add a `--pnl-mode=fifo` pass that re-runs the
-  fill stream through `LotAccountant` and emits a closed-lot CSV
-  alongside the existing PnL curve. Deferred.
-- Lot-level serde for closed-lot persistence / export. The types
-  are already `Clone + Copy + Debug + Eq`; serde derives can
-  land in a follow-up once the audit sink grows a tax-lot event.
-- Gas + bridge fees (section 8's DEX side) still need a dedicated
-  capture path. Neither accountant touches them yet.
-- Cross-asset commission conversion (BNB discount in particular).
-  Both accountants under-count fees whenever BNB-denominated
-  commissions are material on Binance.
+- Accountant fuzzing on *partial* multi-lot closes. The WAC/FIFO
+  divergence there is expected per design, but there's no direct
+  proptest of FIFO's invariants mid-stream (only at the end of the
+  fold). A step-level invariant checker would close that gap.
+- Property tests on the `ts-core` decimal / scale math once we grow
+  past simple `i64` mantissa (current arithmetic is trivially safe;
+  properties become load-bearing when we add fee-asset conversion
+  or cross-asset mark-to-market).
+- Extend proptest coverage to the order-book matcher in `ts-paper`
+  (queue invariant + monotone `seq`) — currently only unit-tested.
+
+## Prior phase (2026-04-19 earlier)
+FIFO tax-lot accounting alongside WAC in `ts-pnl`. See commit
+`fcdd3d7` and earlier NOTES versions for the full design trace.
 
 ## Prior phase (2026-04-18)
 Edge-triggered kill-switch cancel sweep on both EngineRunner and
-LiveRunner. See commit `80377ff` and preceding notes for full
-rationale; summary: one sweep per halted epoch via
-`swept_after_trip` latch, strategy tick skipped while halted,
-`Place`s emitted from `on_shutdown` dropped with a log.
+LiveRunner. See commit `80377ff`; summary: one sweep per halted
+epoch via `swept_after_trip` latch, strategy tick skipped while
+halted, `Place`s emitted from `on_shutdown` dropped with a log.

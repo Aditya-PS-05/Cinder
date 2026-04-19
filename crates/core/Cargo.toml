@@ -13,6 +13,7 @@ serde = { workspace = true, optional = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 serde = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 default = []
