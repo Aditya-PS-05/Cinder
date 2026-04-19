@@ -10,7 +10,9 @@
 #![forbid(unsafe_code)]
 
 pub mod kill_switch;
+pub mod pnl_guard;
 pub use kill_switch::{KillSwitch, KillSwitchConfig, TripReason};
+pub use pnl_guard::{GuardBreach, PnlGuard, PnlGuardConfig};
 
 use std::collections::{HashMap, HashSet};
 

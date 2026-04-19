@@ -33,6 +33,11 @@ pub enum TripReason {
     /// `trip(External)` — caller tripped from outside without a richer
     /// reason (e.g. parent process signalled a shutdown).
     External,
+    /// Equity drawdown from peak exceeded the configured limit.
+    MaxDrawdown,
+    /// Realized-net loss since the start of the current day exceeded
+    /// the configured limit.
+    DailyLoss,
 }
 
 impl TripReason {
@@ -41,6 +46,8 @@ impl TripReason {
             TripReason::RejectRate => 1,
             TripReason::Manual => 2,
             TripReason::External => 3,
+            TripReason::MaxDrawdown => 4,
+            TripReason::DailyLoss => 5,
         }
     }
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -48,6 +55,8 @@ impl TripReason {
             1 => Some(TripReason::RejectRate),
             2 => Some(TripReason::Manual),
             3 => Some(TripReason::External),
+            4 => Some(TripReason::MaxDrawdown),
+            5 => Some(TripReason::DailyLoss),
             _ => None,
         }
     }
