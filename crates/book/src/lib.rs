@@ -18,7 +18,9 @@ use thiserror::Error;
 
 use ts_core::{BookDelta, BookLevel, BookSnapshot, Price, Qty};
 
+pub mod features;
 pub mod vol;
+pub use features::{Ewma, RollingWindow, Vpin};
 pub use vol::EwmaVol;
 
 #[derive(Debug, Error, PartialEq, Eq)]
