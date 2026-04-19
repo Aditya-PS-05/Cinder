@@ -97,6 +97,21 @@ pub struct LiveRunner<E: OrderEngine> {
     /// `source="stream"` metric series so operators can see
     /// stream-vs-REST provenance side by side.
     stream_illegal_counter: Option<Arc<AtomicU64>>,
+    /// Tracks whether the post-trip cancel sweep has already run for
+    /// the current halted epoch. Flips to `true` on the first
+    /// reconcile tick where the kill switch is tripped; flips back to
+    /// `false` when the switch clears so a later re-trip runs a fresh
+    /// sweep. Without this flag the strategy's `on_shutdown` would
+    /// either be called repeatedly (leaking no-op cancel-reject
+    /// reports) or never (leaving orders live on the venue until
+    /// process exit).
+    swept_after_trip: bool,
+    /// Most recent event timestamp, kept as a field so the
+    /// reconcile-driven trip sweep can stamp cancel submissions with
+    /// a timestamp consistent with the event stream. Updated on
+    /// every market event, mirroring the previous `last_ts` local in
+    /// `run`.
+    last_event_ts: Timestamp,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -174,10 +189,6 @@ impl<E: OrderEngine> LiveRunner<E> {
             Some(i)
         };
 
-        // Track the most recent event timestamp so shutdown-sweep
-        // cancels can be stamped consistently with the event stream.
-        let mut last_ts = Timestamp::default();
-
         loop {
             tokio::select! {
                 biased;
@@ -190,7 +201,7 @@ impl<E: OrderEngine> LiveRunner<E> {
                         debug!("live-runner: event channel closed");
                         break;
                     };
-                    last_ts = event.local_ts;
+                    self.last_event_ts = event.local_ts;
                     if let Some(m) = self.metrics.as_ref() {
                         m.observe_event(&event);
                     }
@@ -215,12 +226,58 @@ impl<E: OrderEngine> LiveRunner<E> {
         // Cancel any quotes the strategy still holds. Without this the
         // venue keeps resting orders across a process restart, which is
         // exactly the failure mode a trader most wants to avoid.
-        self.drain_strategy_shutdown(last_ts).await;
+        self.drain_strategy_shutdown(self.last_event_ts).await;
 
         // One last reconcile so anything that landed between the final
         // event and shutdown (including the cancels above) isn't lost.
         self.drain_reconcile().await;
         self.summary.clone()
+    }
+
+    /// Drive the kill-switch trip sweep at most once per halted
+    /// epoch. Called at the tail of every reconcile tick, so the
+    /// sweep fires within one reconcile interval of the switch
+    /// tripping. `Place` actions coming back from `on_shutdown` are
+    /// ignored — the whole point of a trip is to stop opening new
+    /// exposure; only `Cancel` actions are forwarded to the engine.
+    async fn apply_trip_sweep(&mut self) {
+        let Some(ks) = self.kill_switch.as_ref() else {
+            return;
+        };
+        let tripped = ks.tripped();
+        if !tripped {
+            // Operator cleared the switch; re-arm the sweep so a later
+            // re-trip fires another one.
+            if self.swept_after_trip {
+                debug!("live-runner: kill switch cleared; re-arming trip sweep");
+                self.swept_after_trip = false;
+            }
+            return;
+        }
+        if self.swept_after_trip {
+            return;
+        }
+        self.swept_after_trip = true;
+        warn!("live-runner: kill switch tripped; running cancel sweep");
+        let actions = self.strategy.on_shutdown();
+        for action in actions {
+            match action {
+                StrategyAction::Cancel(cid) => match self.engine.cancel(&cid) {
+                    Ok(report) => self.observe_report(report).await,
+                    Err(err) => {
+                        error!(error = %err, "live-runner: trip-sweep cancel failed");
+                        self.summary.reconcile_errors += 1;
+                    }
+                },
+                StrategyAction::Place(order) => {
+                    // `on_shutdown` is contractually cancel-only; a
+                    // Place here would be a strategy bug. Log once
+                    // and drop — we never want to open new risk after
+                    // a trip.
+                    warn!(cid = ?order.cid, "live-runner: dropping Place from on_shutdown during trip sweep");
+                }
+            }
+        }
     }
 
     async fn drain_strategy_shutdown(&mut self, now: Timestamp) {
@@ -268,13 +325,21 @@ impl<E: OrderEngine> LiveRunner<E> {
             return;
         }
 
+        // While halted, skip the strategy tick entirely. Ticking and
+        // dropping emitted actions would advance the strategy's
+        // internal cid tracking for orders we never placed — a silent
+        // drift between what the maker thinks is live and what's
+        // actually on the venue. The paper engine enforces the same
+        // invariant (`PaperEngine::apply_event` short-circuits while
+        // `paused`); this keeps the two runners aligned. The trip
+        // sweep in `drain_reconcile` handles cleanup of already-live
+        // orders.
+        if self.kill_switch.as_ref().is_some_and(|ks| ks.tripped()) {
+            return;
+        }
+
         let actions = self.strategy.on_book_update(event.local_ts, &self.book);
-        let halted = self.kill_switch.as_ref().is_some_and(|ks| ks.tripped());
         for action in actions {
-            if halted {
-                warn!("live-runner: kill switch tripped; dropping strategy action");
-                continue;
-            }
             match action {
                 StrategyAction::Place(order) => {
                     self.submit_with_risk(order, event.local_ts, "submit failed")
@@ -363,6 +428,14 @@ impl<E: OrderEngine> LiveRunner<E> {
                 self.summary.reconcile_errors += 1;
             }
         }
+        // Edge-triggered cancel sweep on kill-switch trip. The first
+        // reconcile tick that observes `halted` runs the strategy's
+        // `on_shutdown` sweep and forwards its cancels through the
+        // venue. This bounds the time between trip and
+        // cancel-on-venue to one reconcile interval, rather than
+        // leaving orders resting until process exit. The flag resets
+        // when the switch clears so a re-trip runs another sweep.
+        self.apply_trip_sweep().await;
         // Mirror the cumulative illegal-transition counters into
         // Prometheus on every tick. Two sources: the engine (REST
         // reconcile path) and, when attached, the user-data-stream
@@ -599,6 +672,8 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             risk: RiskEngine::new(self.risk_config),
             live_cids: HashSet::new(),
             stream_illegal_counter: self.stream_illegal_counter,
+            swept_after_trip: false,
+            last_event_ts: Timestamp::default(),
         };
         (runner, handle)
     }
@@ -1150,6 +1225,162 @@ mod tests {
         );
         // Transport never fired, so there can be no reconcile_errors.
         assert_eq!(summary.reconcile_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_trip_cancels_open_quotes_via_reconcile_sweep() {
+        use ts_risk::{KillSwitch, TripReason};
+        // Phase: when the kill switch trips, the live runner must not
+        // wait until process exit to cancel open quotes. Seed the
+        // maker with two NEW acks so both quotes land on the venue,
+        // then trip the switch and queue two Canceled acks for the
+        // sweep. The reconcile tick drains the sweep's HTTP calls;
+        // orders_canceled must reflect them. Without the sweep,
+        // QueuedApi's pop() wouldn't be called for cancels during the
+        // run and orders_canceled would stay at 0.
+        let api = QueuedApi::new(vec![
+            Ok(ack("bid-1", "NEW")),
+            Ok(ack("ask-1", "NEW")),
+            Ok(ack("bid-1", "CANCELED")),
+            Ok(ack("ask-1", "CANCELED")),
+        ]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 32);
+
+        let ks = Arc::new(KillSwitch::default());
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+
+        // Wait for both NEW acks to drain.
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        ks.trip(TripReason::Manual);
+
+        // Wait for the reconcile-driven trip sweep to fire and both
+        // cancel acks to drain.
+        for _ in 0..80 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        // BinanceLiveEngine emits an optimistic Canceled synchronously
+        // AND an async Canceled via reconcile, so each real cancel
+        // surfaces as two Canceled reports to the runner. The trip
+        // sweep cancels both quotes → 4 reports. The floor >= 2 would
+        // pass even without the sweep; the ceiling check proves the
+        // sweep didn't duplicate itself. orders_submitted stays at 2
+        // because that counter increments once per risk-passed Place.
+        assert_eq!(summary.orders_submitted, 2);
+        assert_eq!(
+            summary.orders_canceled, 4,
+            "trip sweep must cancel both open quotes; summary={summary:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trip_sweep_fires_once_per_halted_epoch() {
+        use ts_risk::{KillSwitch, TripReason};
+        // After the initial sweep consumes two cancel acks, any extra
+        // reconcile ticks must not re-enter on_shutdown — the queue
+        // only holds two cancel responses, so a second attempt would
+        // exhaust the queue and panic on pop(). Verifying the panic
+        // does NOT fire proves the edge-triggered semantics hold.
+        let api = QueuedApi::new(vec![
+            Ok(ack("bid-1", "NEW")),
+            Ok(ack("ask-1", "NEW")),
+            Ok(ack("bid-1", "CANCELED")),
+            Ok(ack("ask-1", "CANCELED")),
+        ]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 32);
+
+        let ks = Arc::new(KillSwitch::default());
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        ks.trip(TripReason::Manual);
+        // Many reconcile ticks while halted. If the sweep re-fired
+        // on every tick, the strategy would emit no cancels (tracked
+        // cids already cleared) so the queue still wouldn't exhaust,
+        // but the runner would ALSO skip the strategy tick while
+        // halted — meaning no new Place submissions, so the queue's
+        // four entries must remain at four consumed total.
+        for _ in 0..120 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tx.send(snapshot(10_001, 10_011, 2)).await.ok();
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        // Two initial submits (risk-passed, counted once) and two real
+        // cancels from the sweep. Each cancel doubles in the
+        // Canceled-report counter (optimistic + reconcile), so 4 is
+        // the exact ceiling: a re-entered sweep would cancel-reject
+        // the already-dead cids and push orders_rejected up,
+        // something this assertion catches too.
+        assert_eq!(summary.orders_submitted, 2);
+        assert_eq!(summary.orders_canceled, 4);
+        assert_eq!(summary.orders_rejected, 0);
+        assert_eq!(summary.reconcile_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn halted_runner_skips_strategy_tick() {
+        use ts_risk::{KillSwitch, TripReason};
+        // Trip the switch BEFORE any market event. An empty QueuedApi
+        // would panic on pop() if the strategy tick produced any
+        // submit, so surviving the test with zero calls is the
+        // assertion that the strategy was not ticked while halted.
+        // The trip sweep itself is a no-op — the strategy has no
+        // tracked cids.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        ks.trip(TripReason::Manual);
+
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(summary.orders_submitted, 0);
+        assert_eq!(summary.orders_canceled, 0);
+        assert_eq!(summary.events_ingested, 1);
+        assert_eq!(summary.book_updates, 1);
     }
 
     #[tokio::test]

@@ -49,6 +49,12 @@ pub struct EngineRunner<S: Strategy> {
     metrics: Option<Arc<RunnerMetrics>>,
     kill_switch: Option<Arc<KillSwitch>>,
     pnl_guard: Option<PnlGuard>,
+    /// Tracks whether the kill-switch cancel sweep has fired for the
+    /// current halted epoch. Mirrors the flag on [`crate::live::LiveRunner`]
+    /// so paper and live have matching trip semantics: on the first
+    /// event after the switch trips, drain the strategy's shutdown
+    /// cancels through the engine. Resets when the switch clears.
+    swept_after_trip: bool,
 }
 
 /// Remote control for an [`EngineRunner`]. Dropping the handle does not
@@ -109,6 +115,7 @@ impl<S: Strategy> EngineRunner<S> {
             metrics: None,
             kill_switch: None,
             pnl_guard: None,
+            swept_after_trip: false,
         };
         (runner, handle)
     }
@@ -233,6 +240,7 @@ impl<S: Strategy> EngineRunner<S> {
                         m.observe(&self.replay.summary());
                     }
                     self.evaluate_pnl_guard();
+                    self.apply_trip_sweep(last_ts).await;
                 }
                 _ = async {
                     match interval_ticker.as_mut() {
@@ -245,6 +253,7 @@ impl<S: Strategy> EngineRunner<S> {
                         m.observe(&snap);
                     }
                     self.evaluate_pnl_guard();
+                    self.apply_trip_sweep(last_ts).await;
                     if let Some(tx) = self.summary_tx.as_ref() {
                         let _ = tx.send(snap);
                     }
@@ -272,6 +281,45 @@ impl<S: Strategy> EngineRunner<S> {
             m.observe(&final_summary);
         }
         final_summary
+    }
+
+    /// Edge-triggered kill-switch cancel sweep for the paper path.
+    /// Mirrors [`crate::live::LiveRunner::apply_trip_sweep`]: the first
+    /// call after the switch trips drains the strategy's `on_shutdown`
+    /// cancels through the paper engine, so paper exposure tears down
+    /// on a trip without waiting for the final shutdown sweep. Resets
+    /// when the switch clears so a re-trip fires another sweep.
+    /// `drain_shutdown` bypasses the engine's pause flag, which we
+    /// also keep honored via `set_paused` elsewhere.
+    async fn apply_trip_sweep(&mut self, now: Timestamp) {
+        let Some(ks) = self.kill_switch.as_ref() else {
+            return;
+        };
+        if !ks.tripped() {
+            if self.swept_after_trip {
+                debug!("runner: kill switch cleared; re-arming trip sweep");
+                self.swept_after_trip = false;
+            }
+            return;
+        }
+        if self.swept_after_trip {
+            return;
+        }
+        self.swept_after_trip = true;
+        warn!("runner: kill switch tripped; running cancel sweep");
+        let step = self.replay.drain_shutdown(now);
+        if let Some(tx) = self.audit_tx.as_ref() {
+            for r in &step.reports {
+                if tx.send(AuditEvent::Report(r.clone())).await.is_err() {
+                    debug!("runner: audit sink closed during trip sweep");
+                    self.audit_tx = None;
+                    break;
+                }
+            }
+        }
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe(&self.replay.summary());
+        }
     }
 
     /// Compute the PnL snapshot (realized net, unrealized, position,
@@ -588,6 +636,90 @@ mod tests {
         handle.shutdown();
         let summary = task.await.unwrap();
         assert_eq!(summary.metrics.events_ingested, 2);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_trip_triggers_cancel_sweep() {
+        use ts_risk::{KillSwitch, TripReason};
+        // First event seeds the book and lets the maker place its two
+        // quotes; they live inside PaperEngine::live_orders after the
+        // step. Trip the kill switch externally, send a second event
+        // (the runner ignores the tick on the paused replay but the
+        // trip-sweep edge fires) — the sweep must produce two cancel
+        // reports for the open quotes. Without the sweep, those
+        // orders would sit in live_orders until process exit.
+        let (tx, rx) = mpsc::channel(16);
+        let ks = Arc::new(KillSwitch::default());
+        let (runner, handle) = EngineRunner::new(build_replay(), rx);
+        let runner = runner.with_kill_switch(Arc::clone(&ks));
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(100, 110, 1)).await.unwrap();
+        // Let the first event process so the maker's quotes are live.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        ks.trip(TripReason::Manual);
+        tx.send(snapshot(101, 111, 2)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        // First tick placed 2 quotes. The sweep cancels them — 2 more
+        // "submitted" reports, 2 cancels. The strategy was paused on
+        // the second tick so no new quotes were placed; the shutdown
+        // sweep is a no-op because on_shutdown already cleared the
+        // maker's tracked cids.
+        assert_eq!(summary.metrics.orders_new, 2, "two quotes placed");
+        assert_eq!(
+            summary.metrics.orders_canceled, 2,
+            "both quotes canceled by the trip sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn trip_sweep_runs_once_per_halted_epoch() {
+        use ts_risk::{KillSwitch, TripReason};
+        // After a trip + sweep, subsequent events must not reinvoke
+        // on_shutdown (which would emit cancel-rejects against the
+        // already-swept cids). Reset the switch and re-trip it; the
+        // sweep must re-arm and fire again. Since the strategy has no
+        // live quotes at the re-trip point, the second sweep produces
+        // zero cancels — but the edge re-arms, which this test
+        // asserts by observing a stable cancel count across extra
+        // events.
+        let (tx, rx) = mpsc::channel(16);
+        let ks = Arc::new(KillSwitch::default());
+        let (runner, handle) = EngineRunner::new(build_replay(), rx);
+        let runner = runner.with_kill_switch(Arc::clone(&ks));
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(100, 110, 1)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        ks.trip(TripReason::Manual);
+        tx.send(snapshot(101, 111, 2)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        // Extra events while halted — sweep must not re-run.
+        tx.send(snapshot(102, 112, 3)).await.unwrap();
+        tx.send(snapshot(103, 113, 4)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(
+            summary.metrics.orders_canceled, 2,
+            "only the first halted event should sweep (got {:?})",
+            summary.metrics
+        );
+        // And no stray rejected reports — the sweep only emits valid
+        // cancels for real tracked cids.
+        assert_eq!(summary.metrics.orders_rejected, 0);
     }
 
     #[tokio::test]

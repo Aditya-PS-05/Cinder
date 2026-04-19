@@ -1,68 +1,87 @@
 # Cinder build notes
 
 ## Current phase (2026-04-19)
-Wire the user-data-stream listener's illegal-transition counter
-into `RunnerMetrics` so operators can see stream-vs-REST provenance
-side by side. Finishes the follow-up parked in the last session.
+Harden kill-switch trip semantics so open orders get canceled on
+the venue within one reconcile tick of a trip, rather than
+lingering until process exit. Closes the "Tripped-switch drops
+ALL strategy actions including Cancels" follow-up from the
+previous phase.
 
 ## What shipped this phase
-- `UserDataStreamClient::illegal_transitions_counter() -> Arc<AtomicU64>`
-  exposes the listener's internal counter as a shared handle.
-  `TransitionGuard::illegal` flipped from `AtomicU64` to
-  `Arc<AtomicU64>` so cloning the handle is cheap and every
-  publish stays lock-free (single load).
-- `RunnerMetrics` now keeps two counters side by side:
-  `illegal_transitions_engine` and `illegal_transitions_stream`.
-  Encoding moved from the unlabeled `ts_illegal_transitions_total`
-  to a labeled series:
-  - `ts_illegal_transitions_total{source="engine"}` — REST reconcile
-    path, sourced from `OrderEngine::illegal_transitions`.
-  - `ts_illegal_transitions_total{source="stream"}` — user-data-stream
-    listener, sourced from the shared `Arc<AtomicU64>`.
-  Both series are emitted unconditionally (default 0) so scrapes don't
-  race on first-seen-label behaviour.
-- `LiveRunnerBuilder::stream_illegal_counter(Arc<AtomicU64>)` wires
-  the listener counter into the runner. `LiveRunner::drain_reconcile`
-  publishes both counters on every tick; when no stream counter is
-  attached the `stream` series stays pegged at 0.
-- `ts-live-run`: reordered the binary so `UserDataStreamClient::new`
-  runs before `LiveRunner::builder` finalizes — the builder needs
-  the counter handle before `build()`. The WS-run task still owns
-  the client by value.
+- `LiveRunner::handle_market_event` now short-circuits before
+  calling `strategy.on_book_update` when the kill switch is
+  tripped. Prior behavior ticked the strategy, then dropped every
+  emitted action — which silently advanced the maker's cid
+  tracking for quotes we never actually placed, creating drift
+  between the maker's internal view and the venue. Paper's
+  `PaperEngine::apply_event` already honored this invariant via
+  the `paused` flag; live now matches.
+- New `LiveRunner::apply_trip_sweep` runs at the tail of every
+  `drain_reconcile` tick. On the first tick where the switch is
+  tripped, it calls `strategy.on_shutdown()` and forwards the
+  resulting `Cancel` actions to the engine. Places that come
+  back from `on_shutdown` (a strategy bug — the trait is
+  cancel-only) are logged and dropped. Tracked via a new
+  `swept_after_trip: bool` field; resets when the switch clears
+  so operator reset + re-trip fires another sweep.
+- New `LiveRunner::last_event_ts: Timestamp` field replaces the
+  prior `run`-local `last_ts` so the sweep path can stamp
+  cancels with a consistent timestamp without threading the
+  value through three callers. `drain_strategy_shutdown` reads
+  the same field on graceful exit.
+- `EngineRunner::apply_trip_sweep` is the paper analog: runs on
+  each event-processed + summary tick, calls
+  `replay.drain_shutdown(last_ts)` (which bypasses the engine's
+  `paused` flag), forwards the resulting reports to the audit
+  sink, and refreshes metrics. Same `swept_after_trip` latch.
+- Tests: `kill_switch_trip_cancels_open_quotes_via_reconcile_sweep`,
+  `trip_sweep_fires_once_per_halted_epoch`, and
+  `halted_runner_skips_strategy_tick` on the live side;
+  `kill_switch_trip_triggers_cancel_sweep` and
+  `trip_sweep_runs_once_per_halted_epoch` on the paper side.
 
 ## Design calls
-- Labels over multiple metric names: `ts_illegal_transitions_total`
-  with a `source=` label keeps cardinality bounded (exactly 2 today)
-  and lets a single Grafana panel sum or break it out. Adding
-  a second unlabeled counter would force duplicate HELP/TYPE lines
-  and split dashboards.
-- `Arc<AtomicU64>` over a callback: `fn() -> u64` would work but
-  closes over state that the runner doesn't need to own. The `Arc`
-  clone is the lightest coupling that still keeps the publish path
-  lock-free.
-- Always emit both labels at 0 (rather than lazy-emit when observed):
-  Prometheus treats missing series as "missing", not "zero", which
-  would hide a healthy stream and break `rate()` on the series at
-  startup. The cost of the extra line is two bytes.
-- `LiveRunner` takes `Option<Arc<AtomicU64>>` — tests that don't
-  attach a stream counter still want the engine counter to publish.
+- **Edge-triggered, latched**: one sweep per halted epoch, not
+  per reconcile tick. Re-entering `on_shutdown` after the
+  strategy has already cleared its tracked cids would flood the
+  cancel path with `unknown cid` rejects, which `record_reject`
+  would count against the kill-switch's own reject-rate
+  trigger. The `swept_after_trip` latch resets on clear so
+  operator reset → re-trip still gets a fresh sweep.
+- **Skip strategy tick while halted, not just actions**:
+  emitting and then ignoring a Place would keep the maker's
+  `open_bid`/`open_ask` populated with cids that never existed
+  on the venue; the next cancel for those would fail as
+  `unknown cid`. Skipping the tick entirely keeps the maker's
+  state consistent with reality.
+- **Drop Places from `on_shutdown`, log once**: the trait
+  contract is cancel-only, but a defensive filter avoids
+  re-entering risk / venue with a new order right after we
+  tripped to stop exposure.
+- **Run sweep in `drain_reconcile`, not in the trip path
+  itself**: the kill switch is a shared `Arc<KillSwitch>`
+  tripped from many places (halt-file watcher, PnL guard,
+  reject-rate). Tying the sweep to the runner's own reconcile
+  tick keeps the cleanup single-threaded with the engine's
+  submit/cancel machinery — no async re-entry into the same
+  `OrderEngine`.
 
 ## Follow-ups
-- Per-symbol label on the illegal-transition counter once the runner
-  multiplexes more than one instrument. Currently both sources are
-  process-global counts.
-- Tie `illegal_transitions_stream > 0` into an alert — a stream
-  reorder once an hour is noise, a sustained climb means the listener
-  is falling behind its reconcile peer and fills might be getting
-  suppressed.
-- Leverage + cross-venue exposure still unshipped (needs perps/margin
-  data and a cross-venue exposure tracker).
-- Per-symbol `ts_position{symbol="..."}` labelled gauges once the
-  runner multiplexes more than one instrument.
-- True auto-flatten (submit closing orders on breach) still needs a
-  position-reversal helper. Park until SOR scaffolding exists.
-- Tripped-switch semantics drop ALL strategy actions including
-  Cancels (`live.rs` `handle_market_event`). Leaves open orders
-  alive until the runner exits and the shutdown sweep runs.
-- Cross-asset commission accounting still open; guard under-counts
-  daily loss whenever BNB-discounted fees are material.
+- Trip sweep currently fires once per runner even when multiple
+  trip reasons stack. If a drawdown trip clears and a
+  reject-rate trip fires, the latch re-arms on clear — no
+  action needed. But an operator who trips manually mid-sweep
+  sees only one sweep for the whole halted epoch, not one per
+  reason. Probably fine; re-visit if we ever want per-reason
+  audit tagging.
+- True auto-flatten (submit closing market orders to zero out
+  position) still needs a position-reversal helper. Parked
+  until SOR scaffolding exists — see section 5 in `todo.md`.
+- Per-symbol illegal-transition labels once the runner
+  multiplexes more than one instrument. Still process-global.
+- Cross-asset commission accounting; guard under-counts daily
+  loss whenever BNB-discounted fees are material.
+- Manual-intervention audit log (section 13 P0) — halt-file
+  trips and operator resets are logged, but free-form
+  `/admin/halt` style RPCs don't have a dedicated append-only
+  log yet.
