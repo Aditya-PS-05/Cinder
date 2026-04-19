@@ -31,11 +31,14 @@ use tracing::{debug, error, warn};
 use ts_book::OrderBook;
 use ts_core::{
     ClientOrderId, ExecReport, Fill, MarketEvent, MarketPayload, NewOrder, OrderKind, Price, Side,
-    Timestamp,
+    Timestamp, Venue,
 };
 use ts_oms::OrderEngine;
 use ts_pnl::Accountant;
-use ts_risk::{ClockSkewGuard, KillSwitch, PnlGuard, RiskConfig, RiskEngine, StalenessGuard};
+use ts_risk::{
+    ClockSkewGuard, ClockSkewSnapshot, ClockSkewTracker, KillSwitch, PnlGuard, RiskConfig,
+    RiskEngine, StalenessGuard,
+};
 use ts_strategy::{Strategy, StrategyAction};
 
 use crate::audit::AuditEvent;
@@ -64,6 +67,12 @@ pub struct LiveSummary {
     /// the runner cleaned up, but the strategy's shutdown path is not
     /// trustworthy and should be fixed.
     pub trip_sweep_orphan_cancels: u64,
+    /// Per-venue running-stats of `local_ts - exchange_ts` observed on
+    /// the market-data feed. Mirrors the internal [`ClockSkewTracker`]
+    /// into the summary stream so dashboards + post-run asserts can
+    /// read drift without touching runner internals. Order is not
+    /// specified; consumers that need determinism should sort.
+    pub clock_skew: Vec<(Venue, ClockSkewSnapshot)>,
 }
 
 /// Driver around an [`OrderEngine`] + [`Strategy`] + local [`OrderBook`].
@@ -144,6 +153,13 @@ pub struct LiveRunner<E: OrderEngine> {
     /// [`ts_risk::TripReason::ClockSkew`] so latency-sensitive logic
     /// does not operate on bogus timing.
     clock_skew_guard: Option<ClockSkewGuard>,
+    /// Per-venue running-stats view of `local_ts - exchange_ts`. Folds
+    /// every event into a [`ClockSkewTracker`] so operators see the
+    /// steady-state drift (mean, sample stddev, max-abs) alongside the
+    /// guard's one-shot breach. Always present — the tracker is a
+    /// zero-cost empty map until the first observation — so callers
+    /// don't need a feature gate.
+    clock_skew_tracker: ClockSkewTracker,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -196,6 +212,16 @@ impl<E: OrderEngine> LiveRunner<E> {
             staleness_guard: None,
             clock_skew_guard: None,
         }
+    }
+
+    /// Current per-venue clock-skew snapshot. Order is not specified;
+    /// callers that need determinism should collect and sort. Intended
+    /// for the summary printer / metrics scrape — an observability
+    /// read, not a trigger for any action.
+    pub fn clock_skew_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (ts_core::Venue, ClockSkewSnapshot)> + '_ {
+        self.clock_skew_tracker.iter()
     }
 
     /// Drive the runner until the event channel closes or the handle
@@ -427,6 +453,21 @@ impl<E: OrderEngine> LiveRunner<E> {
                     }
                 }
             }
+        }
+        // Observation-only drift tracker. Only record when both sides
+        // of the timestamp pair are set — an unset side yields a
+        // nonsensical delta that would pollute the running stats.
+        if !event.exchange_ts.is_unset() && !event.local_ts.is_unset() {
+            let skew_ns = event.local_ts.0.saturating_sub(event.exchange_ts.0);
+            let skew_ms = skew_ns / 1_000_000;
+            self.clock_skew_tracker
+                .observe(event.venue.clone(), skew_ms);
+            // Mirror the current tracker state into the summary so
+            // the next broadcast + the final return both carry a
+            // fresh snapshot. Cheap: one small Vec per observation,
+            // cardinality is bounded by the number of venues (1 in
+            // practice for ts-live-run today).
+            self.summary.clock_skew = self.clock_skew_tracker.iter().collect();
         }
 
         enum TickKind<'a> {
@@ -938,6 +979,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             intent_log: self.intent_log,
             staleness_guard: self.staleness_guard,
             clock_skew_guard: self.clock_skew_guard,
+            clock_skew_tracker: ClockSkewTracker::new(),
         };
         (runner, handle)
     }
@@ -2186,6 +2228,97 @@ mod tests {
         assert!(
             !ks.tripped(),
             "event skew under limit must not trip the switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn clock_skew_tracker_folds_every_event_into_summary() {
+        // Drive four events with 1/3/5/7 ms skew (local ahead of
+        // exchange). The tracker should report samples=4, a running
+        // mean of 4 ms, and max_abs of 7. No kill switch, no guard —
+        // the tracker runs unconditionally.
+        let api = QueuedApi::new(vec![Ok(ack("bid-1", "NEW")), Ok(ack("ask-1", "NEW"))]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        let skews_ms = [1_i64, 3, 5, 7];
+        for (seq, &ms) in skews_ms.iter().enumerate() {
+            let exch = Timestamp::from_unix_millis(1_000);
+            let local = Timestamp::from_unix_millis(1_000 + ms);
+            let ev = MarketEvent {
+                venue: venue(),
+                symbol: sym(),
+                exchange_ts: exch,
+                local_ts: local,
+                seq: (seq + 1) as u64,
+                payload: MarketPayload::BookSnapshot(BookSnapshot {
+                    bids: vec![BookLevel {
+                        price: Price(10_000),
+                        qty: Qty(1_000_000),
+                    }],
+                    asks: vec![BookLevel {
+                        price: Price(10_010),
+                        qty: Qty(1_000_000),
+                    }],
+                }),
+            };
+            tx.send(ev).await.unwrap();
+        }
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(summary.clock_skew.len(), 1, "one venue observed");
+        let (v, snap) = &summary.clock_skew[0];
+        assert_eq!(v, &venue());
+        assert_eq!(snap.samples, 4);
+        assert!(
+            (snap.mean_ms - 4.0).abs() < 1e-9,
+            "mean should be 4 ms, got {}",
+            snap.mean_ms
+        );
+        assert_eq!(snap.max_abs_ms, 7);
+        assert_eq!(snap.last_ms, 7);
+    }
+
+    #[tokio::test]
+    async fn clock_skew_tracker_skips_events_with_unset_timestamps() {
+        // Both exchange_ts and local_ts default to unset. Events that
+        // look like a cold start (no timestamps stamped by the
+        // connector) must NOT pollute the running stats with spurious
+        // zero-delta samples.
+        let api = QueuedApi::new(vec![Ok(ack("bid-1", "NEW")), Ok(ack("ask-1", "NEW"))]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+        tx.send(snapshot(10_000, 10_010, 2)).await.unwrap();
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert!(
+            summary.clock_skew.is_empty(),
+            "unset timestamps must produce no tracker entries; got {:?}",
+            summary.clock_skew
         );
     }
 

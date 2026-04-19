@@ -14,10 +14,13 @@
 //! venue's entry has been inserted.
 //!
 //! Units are milliseconds throughout. Callers pass `skew_ms` as a
-//! signed `i64` so positive values mean "exchange clock is ahead of
-//! local" and negatives mean "behind"; the tracker preserves the sign
-//! in `mean_ms` / `last_ms` and reports the unsigned magnitude only on
-//! `max_abs_ms`. The tracker never trips anything by itself — attach a
+//! signed `i64` following the same sign convention as
+//! [`ClockSkewGuard`](crate::ClockSkewGuard): `skew = local - exchange`,
+//! so positive means *local clock is ahead of the venue* (our box
+//! jumped forward, or the venue fell behind) and negative means the
+//! opposite. The tracker preserves the sign in `mean_ms` / `last_ms`
+//! and reports the unsigned magnitude only on `max_abs_ms`. The
+//! tracker never trips anything by itself — attach a
 //! [`ClockSkewGuard`](crate::ClockSkewGuard) for that.
 
 use std::collections::HashMap;
@@ -72,8 +75,9 @@ impl VenueStats {
 pub struct ClockSkewSnapshot {
     /// Count of observations since the tracker was built.
     pub samples: u64,
-    /// Running mean of `exchange_ts - local_ts` in milliseconds.
-    /// Positive means the venue clock is ahead of ours.
+    /// Running mean of `local_ts - exchange_ts` in milliseconds.
+    /// Positive means our local clock leads the venue's; negative
+    /// means the venue leads us.
     pub mean_ms: f64,
     /// Sample standard deviation of the observed deltas. `0.0` when
     /// `samples < 2` (undefined).
@@ -98,8 +102,10 @@ impl ClockSkewTracker {
         Self::default()
     }
 
-    /// Record an observation for `venue`. `skew_ms` is signed —
-    /// positive means the venue's timestamp leads local wall-clock.
+    /// Record an observation for `venue`. `skew_ms` is signed;
+    /// following the [`ClockSkewGuard`](crate::ClockSkewGuard)
+    /// convention, positive means the local clock leads the venue
+    /// (`local_ts - exchange_ts > 0`) and negative means it trails.
     pub fn observe(&mut self, venue: Venue, skew_ms: i64) {
         self.stats.entry(venue).or_default().observe(skew_ms);
     }
