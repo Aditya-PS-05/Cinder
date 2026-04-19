@@ -217,6 +217,7 @@ impl RunnerMetrics {
             Some(ts_risk::TripReason::MaxDrawdown) => 4,
             Some(ts_risk::TripReason::DailyLoss) => 5,
             Some(ts_risk::TripReason::FeedStaleness) => 6,
+            Some(ts_risk::TripReason::ClockSkew) => 7,
             None => 0,
         };
         self.kill_switch_reason.store(code, Ordering::Relaxed);

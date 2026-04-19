@@ -35,7 +35,7 @@ use ts_core::{
 };
 use ts_oms::OrderEngine;
 use ts_pnl::Accountant;
-use ts_risk::{KillSwitch, PnlGuard, RiskConfig, RiskEngine, StalenessGuard};
+use ts_risk::{ClockSkewGuard, KillSwitch, PnlGuard, RiskConfig, RiskEngine, StalenessGuard};
 use ts_strategy::{Strategy, StrategyAction};
 
 use crate::audit::AuditEvent;
@@ -132,6 +132,12 @@ pub struct LiveRunner<E: OrderEngine> {
     /// [`ts_risk::TripReason::FeedStaleness`], so we stop quoting
     /// against a frozen book.
     staleness_guard: Option<StalenessGuard>,
+    /// Detects local-vs-exchange clock drift. Each market event's
+    /// `(exchange_ts, local_ts)` is folded through the guard; a breach
+    /// trips the attached [`KillSwitch`] with
+    /// [`ts_risk::TripReason::ClockSkew`] so latency-sensitive logic
+    /// does not operate on bogus timing.
+    clock_skew_guard: Option<ClockSkewGuard>,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -182,6 +188,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             stream_illegal_counter: None,
             intent_log: None,
             staleness_guard: None,
+            clock_skew_guard: None,
         }
     }
 
@@ -361,6 +368,26 @@ impl<E: OrderEngine> LiveRunner<E> {
         // events *did* arrive before the gap started.
         if let Some(g) = self.staleness_guard.as_mut() {
             g.observe_event(Instant::now());
+        }
+        // Fold event timestamps through the clock-skew guard. Inlined
+        // rather than delegated to a helper because the borrow
+        // checker prefers `self.field.method()` over a mut method
+        // call that also touches `self.kill_switch`.
+        if let Some(g) = self.clock_skew_guard.as_mut() {
+            if let Some(breach) = g.observe(event.exchange_ts, event.local_ts) {
+                if let Some(ks) = self.kill_switch.as_ref() {
+                    if !ks.tripped() {
+                        warn!(
+                            ?breach,
+                            "live-runner: clock-skew guard breach; tripping kill switch"
+                        );
+                        ks.trip(breach.to_trip_reason());
+                        if let Some(m) = self.metrics.as_ref() {
+                            m.observe_kill_switch(ks);
+                        }
+                    }
+                }
+            }
         }
 
         enum TickKind<'a> {
@@ -731,6 +758,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     stream_illegal_counter: Option<Arc<AtomicU64>>,
     intent_log: Option<IntentLogWriter>,
     staleness_guard: Option<StalenessGuard>,
+    clock_skew_guard: Option<ClockSkewGuard>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -826,6 +854,16 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Attach a [`ClockSkewGuard`] to monitor local-vs-exchange clock
+    /// drift. Each market event's `(exchange_ts, local_ts)` is folded
+    /// through the guard; a breach trips the attached [`KillSwitch`]
+    /// with [`ts_risk::TripReason::ClockSkew`]. No-op when no kill
+    /// switch is attached.
+    pub fn clock_skew_guard(mut self, guard: ClockSkewGuard) -> Self {
+        self.clock_skew_guard = Some(guard);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -860,6 +898,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             last_event_ts: Timestamp::default(),
             intent_log: self.intent_log,
             staleness_guard: self.staleness_guard,
+            clock_skew_guard: self.clock_skew_guard,
         };
         (runner, handle)
     }
@@ -1909,6 +1948,110 @@ mod tests {
 
         assert!(ks.tripped(), "silent feed past max_idle must trip");
         assert_eq!(ks.reason(), Some(TripReason::FeedStaleness));
+    }
+
+    #[tokio::test]
+    async fn clock_skew_guard_trips_on_event_with_large_skew() {
+        use ts_risk::{ClockSkewGuard, ClockSkewGuardConfig, KillSwitch, TripReason};
+        let api = QueuedApi::new(vec![Ok(ack("bid-1", "NEW")), Ok(ack("ask-1", "NEW"))]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        // 1 ms limit; inject an event with 500 ms skew.
+        let guard = ClockSkewGuard::new(ClockSkewGuardConfig {
+            max_abs_skew: Some(Duration::from_millis(1)),
+        });
+
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .clock_skew_guard(guard)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        let skewed = MarketEvent {
+            venue: venue(),
+            symbol: sym(),
+            exchange_ts: Timestamp(1_000_000_000),
+            local_ts: Timestamp(1_500_000_000),
+            seq: 1,
+            payload: MarketPayload::BookSnapshot(BookSnapshot {
+                bids: vec![BookLevel {
+                    price: Price(10_000),
+                    qty: Qty(1_000_000),
+                }],
+                asks: vec![BookLevel {
+                    price: Price(10_010),
+                    qty: Qty(1_000_000),
+                }],
+            }),
+        };
+        tx.send(skewed).await.unwrap();
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(ks.tripped(), "large event skew must trip the switch");
+        assert_eq!(ks.reason(), Some(TripReason::ClockSkew));
+    }
+
+    #[tokio::test]
+    async fn clock_skew_guard_does_not_trip_on_within_limit_events() {
+        use ts_risk::{ClockSkewGuard, ClockSkewGuardConfig, KillSwitch};
+        let api = QueuedApi::new(vec![Ok(ack("bid-1", "NEW")), Ok(ack("ask-1", "NEW"))]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = ClockSkewGuard::new(ClockSkewGuardConfig {
+            max_abs_skew: Some(Duration::from_secs(1)),
+        });
+
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .clock_skew_guard(guard)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        // 10 ms skew, well within 1s limit.
+        let ok_event = MarketEvent {
+            venue: venue(),
+            symbol: sym(),
+            exchange_ts: Timestamp(1_000_000_000),
+            local_ts: Timestamp(1_010_000_000),
+            seq: 1,
+            payload: MarketPayload::BookSnapshot(BookSnapshot {
+                bids: vec![BookLevel {
+                    price: Price(10_000),
+                    qty: Qty(1_000_000),
+                }],
+                asks: vec![BookLevel {
+                    price: Price(10_010),
+                    qty: Qty(1_000_000),
+                }],
+            }),
+        };
+        tx.send(ok_event).await.unwrap();
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(
+            !ks.tripped(),
+            "event skew under limit must not trip the switch"
+        );
     }
 
     #[tokio::test]

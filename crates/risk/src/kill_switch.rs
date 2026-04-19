@@ -42,6 +42,11 @@ pub enum TripReason {
     /// idle threshold. Trading on stale marks is a fast way to pick
     /// off our own quotes, so we halt until the feed recovers.
     FeedStaleness,
+    /// Gap between venue-reported and local timestamps exceeded the
+    /// configured limit. Large skew is either our clock drifting or
+    /// the venue's — either way, latency-sensitive logic (TTL, window
+    /// checks, cancel-before-expiry) is unreliable and we halt.
+    ClockSkew,
 }
 
 impl TripReason {
@@ -53,6 +58,7 @@ impl TripReason {
             TripReason::MaxDrawdown => 4,
             TripReason::DailyLoss => 5,
             TripReason::FeedStaleness => 6,
+            TripReason::ClockSkew => 7,
         }
     }
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -63,6 +69,7 @@ impl TripReason {
             4 => Some(TripReason::MaxDrawdown),
             5 => Some(TripReason::DailyLoss),
             6 => Some(TripReason::FeedStaleness),
+            7 => Some(TripReason::ClockSkew),
             _ => None,
         }
     }
