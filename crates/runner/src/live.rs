@@ -39,6 +39,7 @@ use ts_risk::{KillSwitch, PnlGuard, RiskConfig, RiskEngine};
 use ts_strategy::{Strategy, StrategyAction};
 
 use crate::audit::AuditEvent;
+use crate::intent_log::IntentLogWriter;
 use crate::metrics::RunnerMetrics;
 
 /// Mirror of [`ts_replay::ReplaySummary`] for the live path. The live
@@ -117,6 +118,14 @@ pub struct LiveRunner<E: OrderEngine> {
     /// every market event, mirroring the previous `last_ts` local in
     /// `run`.
     last_event_ts: Timestamp,
+    /// Crash-safety WAL. When attached, every pre-trade-passed submit
+    /// is fsynced to this writer *before* the engine's HTTP call fires,
+    /// and every terminal [`ExecReport`] writes a completion tombstone
+    /// so restart-time replay only surfaces cids whose outcome the
+    /// operator never observed. `None` disables the WAL entirely —
+    /// correctness is preserved (the runner never reads the log), but
+    /// crash recovery is manual.
+    intent_log: Option<IntentLogWriter>,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -165,6 +174,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             pnl_guard: None,
             risk_config: RiskConfig::permissive(),
             stream_illegal_counter: None,
+            intent_log: None,
         }
     }
 
@@ -439,6 +449,28 @@ impl<E: OrderEngine> LiveRunner<E> {
         self.live_cids.insert(order.cid.clone());
         self.summary.orders_submitted += 1;
 
+        // Durably record the intent before the engine fires its HTTP
+        // task. A crash between this fsync and the ack guarantees the
+        // intent survives to restart-time replay; a crash *before* the
+        // fsync loses the intent, matching what the venue knows (it
+        // never received the request). A failed WAL write is treated
+        // as a synthetic Rejected so we never leak an intent the
+        // operator can't see.
+        if let Some(w) = self.intent_log.as_mut() {
+            if let Err(err) = w.record_submit(&order).await {
+                error!(error = %err, "live-runner: intent-log submit write failed");
+                self.live_cids.remove(&order.cid);
+                self.risk.record_complete(&order.cid);
+                self.summary.orders_submitted -= 1;
+                let r = ExecReport::rejected(
+                    order.cid.clone(),
+                    format!("intent log write failed: {err}"),
+                );
+                self.observe_report(r).await;
+                return;
+            }
+        }
+
         let cid = order.cid.clone();
         match self.engine.submit(order, now) {
             Ok(report) => self.observe_report(report).await,
@@ -447,9 +479,18 @@ impl<E: OrderEngine> LiveRunner<E> {
                 self.summary.reconcile_errors += 1;
                 // Transport failed; roll back the reservation so the
                 // open-order counter reflects reality. No observe_report
-                // — there was no ack to attribute this to.
+                // — there was no ack to attribute this to. The intent
+                // log still carries the submit line so operators know
+                // the runner *attempted* the order; write a completion
+                // tombstone so restart replay doesn't re-surface it as
+                // an open intent.
                 if self.live_cids.remove(&cid) {
                     self.risk.record_complete(&cid);
+                }
+                if let Some(w) = self.intent_log.as_mut() {
+                    if let Err(err) = w.record_complete(&cid).await {
+                        warn!(error = %err, "live-runner: intent-log completion write failed after transport error");
+                    }
                 }
             }
         }
@@ -582,8 +623,19 @@ impl<E: OrderEngine> LiveRunner<E> {
         // per terminal report, and only for cids we submitted through
         // our pre-trade gate — external cids (user-data-stream pushes)
         // never reserved a slot, so there is nothing to release.
-        if report.status.is_terminal() && self.live_cids.remove(&report.cid) {
+        let terminal_for_tracked_cid =
+            report.status.is_terminal() && self.live_cids.remove(&report.cid);
+        if terminal_for_tracked_cid {
             self.risk.record_complete(&report.cid);
+            // Write the WAL completion tombstone so a crash after this
+            // point leaves no dangling intent on restart-time replay.
+            // A failed fsync here degrades to "operator sees orphan on
+            // next startup" — noisy but safe — so we log and continue.
+            if let Some(w) = self.intent_log.as_mut() {
+                if let Err(err) = w.record_complete(&report.cid).await {
+                    warn!(error = %err, cid = ?report.cid, "live-runner: intent-log completion write failed");
+                }
+            }
         }
         // Fills embedded in a report are re-exposed in `EngineStep::fills`
         // by BinanceLiveEngine::reconcile, so we only forward them from
@@ -637,6 +689,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     pnl_guard: Option<PnlGuard>,
     risk_config: RiskConfig,
     stream_illegal_counter: Option<Arc<AtomicU64>>,
+    intent_log: Option<IntentLogWriter>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -710,6 +763,16 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Attach a crash-safety [`IntentLogWriter`]. When set, every
+    /// pre-trade-passed submit is fsynced to the log *before* the
+    /// engine's HTTP task fires, and every terminal report writes a
+    /// completion tombstone. Open intents are surfaced at next startup
+    /// via [`crate::intent_log::replay_open_intents`].
+    pub fn intent_log(mut self, writer: IntentLogWriter) -> Self {
+        self.intent_log = Some(writer);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -742,6 +805,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             stream_illegal_counter: self.stream_illegal_counter,
             swept_after_trip: false,
             last_event_ts: Timestamp::default(),
+            intent_log: self.intent_log,
         };
         (runner, handle)
     }
@@ -1613,6 +1677,108 @@ mod tests {
         assert_eq!(summary.orders_rejected, 0);
         assert_eq!(summary.orders_submitted, 0);
         assert_eq!(summary.reconcile_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn intent_log_records_submit_then_complete_on_terminal_report() {
+        use crate::intent_log::{replay_open_intents, IntentLogWriter};
+        use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+        // Unique path per test run so parallel-test interleavings don't
+        // step on each other.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ts-live-intent-{}-{}.ndjson",
+            std::process::id(),
+            N.fetch_add(1, AOrdering::Relaxed)
+        ));
+
+        // Writer lives inside the runner. Seed the queued API with two
+        // NEW acks + two FILLED async acks so each quote reaches a
+        // terminal status via the reconcile path.
+        let api = QueuedApi::new(vec![Ok(ack("bid-1", "FILLED")), Ok(ack("ask-1", "FILLED"))]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 32);
+
+        let wal = IntentLogWriter::open(&path).await.unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .intent_log(wal)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+
+        for _ in 0..80 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        // Replay the log — both intents were submitted and terminally
+        // filled, so the open set must be empty. Without the WAL's
+        // completion tombstone path firing in `observe_report`, the two
+        // submits would still be dangling.
+        let open = replay_open_intents(&path).await.unwrap();
+        assert!(
+            open.is_empty(),
+            "terminal fills must clear the WAL; orphans={open:?}"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn intent_log_preserves_open_submits_before_terminal_status() {
+        use crate::intent_log::{replay_open_intents, IntentLogWriter};
+        use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+        // Two NEW acks mean both submits are live but neither has
+        // reached a terminal status. Simulate a hard crash by
+        // aborting the task — this skips the graceful shutdown
+        // cancel-sweep that would otherwise write completion
+        // tombstones — and prove the WAL's submits are on durable
+        // storage.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ts-live-intent-orph-{}-{}.ndjson",
+            std::process::id(),
+            N.fetch_add(1, AOrdering::Relaxed)
+        ));
+
+        let api = QueuedApi::new(vec![Ok(ack("bid-1", "NEW")), Ok(ack("ask-1", "NEW"))]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 32);
+
+        let wal = IntentLogWriter::open(&path).await.unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let (runner, _handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .intent_log(wal)
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tx.send(snapshot(10_000, 10_010, 1)).await.unwrap();
+
+        for _ in 0..60 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Crash: drop the task without letting `on_shutdown` run.
+        // The writer's file handle goes away with it, but every
+        // submit already fsynced before returning to the runner.
+        task.abort();
+        let _ = task.await;
+
+        let open = replay_open_intents(&path).await.unwrap();
+        assert_eq!(
+            open.len(),
+            2,
+            "two NEW submits should both surface as open intents after a crash"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

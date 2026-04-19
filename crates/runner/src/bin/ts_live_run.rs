@@ -33,9 +33,10 @@ use ts_risk::{KillSwitch, KillSwitchConfig, PnlGuard, PnlGuardConfig};
 use ts_runner::{
     audit::{spawn_audit_writer, AuditWriter},
     bridge_bus, build_risk_config,
+    intent_log::{replay_open_intents, IntentLogWriter},
     kill_switch_watch::spawn_halt_file_watcher,
     live::{LiveRunner, LiveSummary},
-    live_cfg::{KillSwitchCfg, LiveCfg, RiskCfg},
+    live_cfg::{IntentLogCfg, KillSwitchCfg, LiveCfg, RiskCfg},
     metrics::{spawn_metrics_server, RunnerMetrics},
     paper_cfg::{AuditCfg, MetricsCfg},
 };
@@ -100,6 +101,14 @@ struct Cli {
     /// Append every ExecReport and Fill to this NDJSON file.
     #[arg(long)]
     audit: Option<PathBuf>,
+
+    /// Crash-safety intent WAL. Every pre-trade-passed submit is
+    /// fsynced here before the engine's HTTP call fires; terminal
+    /// reports write a completion tombstone. On startup, orphaned
+    /// intents are logged so operators can reconcile against venue
+    /// state manually.
+    #[arg(long)]
+    intent_log: Option<PathBuf>,
 
     /// Listen address for `/metrics`, e.g. `127.0.0.1:9899`.
     #[arg(long)]
@@ -211,6 +220,9 @@ fn resolve_config(cli: &Cli) -> Result<LiveCfg> {
     }
     if let Some(path) = cli.audit.clone() {
         cfg.audit = Some(AuditCfg { path });
+    }
+    if let Some(path) = cli.intent_log.clone() {
+        cfg.intent_log = Some(IntentLogCfg { path });
     }
     if let Some(listen) = cli.metrics_addr.clone() {
         cfg.metrics = Some(MetricsCfg { listen });
@@ -378,6 +390,39 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     } else {
         None
     };
+
+    // Wire the intent WAL (Section 5 crash-safety). Replay-on-startup
+    // surfaces any orphaned intents from a prior session; operators
+    // reconcile them against venue state manually (the runner never
+    // auto-resubmits). The writer is then attached to the runner so
+    // the current session's submits + terminals extend the log.
+    if let Some(wal_cfg) = cfg.intent_log.as_ref() {
+        let open = replay_open_intents(&wal_cfg.path)
+            .await
+            .with_context(|| format!("replay intent log {}", wal_cfg.path.display()))?;
+        if open.is_empty() {
+            tracing::info!(path = %wal_cfg.path.display(), "intent-log replay: no orphaned intents");
+        } else {
+            tracing::warn!(
+                path = %wal_cfg.path.display(),
+                count = open.len(),
+                "intent-log replay: orphaned intents detected from prior session; reconcile manually",
+            );
+            for order in &open {
+                tracing::warn!(
+                    cid = %order.cid.as_str(),
+                    symbol = %order.symbol.as_str(),
+                    side = ?order.side,
+                    qty = order.qty.0,
+                    "orphan intent",
+                );
+            }
+        }
+        let writer = IntentLogWriter::open(&wal_cfg.path)
+            .await
+            .with_context(|| format!("open intent log {}", wal_cfg.path.display()))?;
+        builder = builder.intent_log(writer);
+    }
 
     let audit_task = if let Some(audit_cfg) = cfg.audit.as_ref() {
         let writer = AuditWriter::create(&audit_cfg.path)

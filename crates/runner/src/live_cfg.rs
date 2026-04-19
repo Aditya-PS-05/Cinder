@@ -29,6 +29,19 @@ pub struct LiveCfg {
     pub kill_switch: Option<KillSwitchCfg>,
     #[serde(default)]
     pub risk: Option<RiskCfg>,
+    /// Crash-safety intent WAL. When set, the live runner records every
+    /// pre-trade-passed submit and every terminal completion to this
+    /// file with an fsync, so a post-crash replay can surface dangling
+    /// intents. Omit to disable the WAL (tests, paper-like dry runs).
+    #[serde(default)]
+    pub intent_log: Option<IntentLogCfg>,
+}
+
+/// Filesystem path of the intent WAL. One-field struct so future knobs
+/// (fsync cadence, rotation) slot in without breaking YAML.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IntentLogCfg {
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

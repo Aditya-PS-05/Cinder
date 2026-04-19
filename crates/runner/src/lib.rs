@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod intent_log;
 pub mod kill_switch_watch;
 pub mod live;
 pub mod live_cfg;
