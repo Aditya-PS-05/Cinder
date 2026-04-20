@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -154,6 +154,28 @@ pub struct RunnerMetrics {
     /// WS → decoder → runner leg; ignores events the venue did not
     /// stamp (both timestamps must be set for the sample to count).
     ingest_latency_nanos: LatencyHistogram,
+
+    /// Cumulative count of [`LiveRunner`](crate::LiveRunner) resync
+    /// ticks. Sourced from [`LiveSummary::venue_resyncs`] on every
+    /// `observe_live` call. Zero when the resync interval is disabled.
+    /// Surfaces as `ts_venue_resyncs_total`.
+    venue_resyncs: AtomicU64,
+
+    /// Optional shared handle to the market-data WebSocket's last-ping
+    /// round-trip time in milliseconds
+    /// (see [`ts_binance::SpotStreamClient::last_ping_rtt_handle`]).
+    /// `None` until the caller attaches it via
+    /// [`Self::attach_ws_ping_rtt`]. When present, the encoder reads
+    /// the current value on every scrape and publishes it as
+    /// `spot_ws_ping_rtt_ms`.
+    ws_ping_rtt_ms: OnceLock<Arc<AtomicU64>>,
+
+    /// Optional shared handle to the market-data WebSocket's cumulative
+    /// resync-event counter
+    /// (see [`ts_binance::SpotStreamClient::resync_counter`]). `None`
+    /// until attached via [`Self::attach_ws_resync_counter`]. Surfaces
+    /// as `spot_ws_resyncs_total` on every scrape.
+    ws_resync_events: OnceLock<Arc<AtomicU64>>,
 
     /// Per-symbol PnL/position gauges. Lazily populated on first
     /// observation per symbol; the `Mutex` guards only the map
@@ -378,6 +400,22 @@ impl RunnerMetrics {
         self.orders_rejected
             .store(summary.orders_rejected, Ordering::Relaxed);
         self.fills.store(summary.fills, Ordering::Relaxed);
+        self.venue_resyncs
+            .store(summary.venue_resyncs, Ordering::Relaxed);
+    }
+
+    /// Attach the market-data WebSocket's ping-RTT shared handle. Idempotent:
+    /// subsequent calls with a different handle are ignored (the first
+    /// wins) so wiring races during startup can't clobber a live handle.
+    /// Returns `true` when the handle was stored.
+    pub fn attach_ws_ping_rtt(&self, handle: Arc<AtomicU64>) -> bool {
+        self.ws_ping_rtt_ms.set(handle).is_ok()
+    }
+
+    /// Attach the market-data WebSocket's cumulative resync-event
+    /// counter. Same idempotency contract as [`Self::attach_ws_ping_rtt`].
+    pub fn attach_ws_resync_counter(&self, handle: Arc<AtomicU64>) -> bool {
+        self.ws_resync_events.set(handle).is_ok()
     }
 
     /// Render the current snapshot in Prometheus text exposition
@@ -497,6 +535,28 @@ impl RunnerMetrics {
             "ts_ingest_latency_nanos",
             "Exchange→local delivery latency per market event (nanoseconds).",
         );
+        counter(
+            &mut out,
+            "ts_venue_resyncs_total",
+            "LiveRunner periodic venue-state resync ticks (one per resync_interval firing).",
+            self.venue_resyncs.load(Ordering::Relaxed),
+        );
+        if let Some(h) = self.ws_ping_rtt_ms.get() {
+            gauge(
+                &mut out,
+                "spot_ws_ping_rtt_ms",
+                "Most recent market-data WebSocket ping round-trip time (milliseconds).",
+                h.load(Ordering::Relaxed) as i64,
+            );
+        }
+        if let Some(h) = self.ws_resync_events.get() {
+            counter(
+                &mut out,
+                "spot_ws_resyncs_total",
+                "Cumulative market-data WebSocket resync events (snapshot re-pulls after gap detection).",
+                h.load(Ordering::Relaxed),
+            );
+        }
         encode_symbol_gauges(&mut out, &self.symbol_snapshot());
         out
     }
@@ -916,6 +976,78 @@ mod tests {
         assert!(
             body2.contains("ts_illegal_transitions_total{source=\"stream\"} 5"),
             "expected stream=5, got:\n{body2}"
+        );
+    }
+
+    #[test]
+    fn venue_resyncs_counter_tracks_live_summary() {
+        let m = RunnerMetrics::new();
+        // Zero by default; counter line always present so scrape
+        // tooling can plot from minute zero without special-casing.
+        let body0 = m.encode_prometheus();
+        assert!(
+            body0.contains("ts_venue_resyncs_total 0"),
+            "expected 0 on startup, got:\n{body0}"
+        );
+
+        let summary = LiveSummary {
+            venue_resyncs: 4,
+            ..Default::default()
+        };
+        m.observe_live(&summary);
+        let body = m.encode_prometheus();
+        assert!(
+            body.contains("ts_venue_resyncs_total 4"),
+            "expected 4 after observe_live, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn spot_ws_handles_are_hidden_until_attached() {
+        let m = RunnerMetrics::new();
+        let body = m.encode_prometheus();
+        assert!(
+            !body.contains("spot_ws_ping_rtt_ms"),
+            "ping RTT gauge must be omitted when handle is not attached, got:\n{body}"
+        );
+        assert!(
+            !body.contains("spot_ws_resyncs_total"),
+            "resync counter must be omitted when handle is not attached, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn spot_ws_handles_surface_shared_atomic_values() {
+        let m = RunnerMetrics::new();
+        // Simulate the SpotStreamClient's shared counters; the encoder
+        // loads them on every scrape, so writes after attach are
+        // reflected on the next render.
+        let rtt = Arc::new(AtomicU64::new(0));
+        let resyncs = Arc::new(AtomicU64::new(0));
+        assert!(m.attach_ws_ping_rtt(Arc::clone(&rtt)));
+        assert!(m.attach_ws_resync_counter(Arc::clone(&resyncs)));
+
+        rtt.store(42, Ordering::Relaxed);
+        resyncs.store(3, Ordering::Relaxed);
+        let body = m.encode_prometheus();
+        assert!(
+            body.contains("spot_ws_ping_rtt_ms 42"),
+            "expected ping RTT=42, got:\n{body}"
+        );
+        assert!(
+            body.contains("spot_ws_resyncs_total 3"),
+            "expected resyncs=3, got:\n{body}"
+        );
+
+        // Subsequent attach calls are ignored (first wins) so startup
+        // races can't clobber a live handle.
+        let other = Arc::new(AtomicU64::new(999));
+        assert!(!m.attach_ws_ping_rtt(Arc::clone(&other)));
+        assert!(!m.attach_ws_resync_counter(Arc::clone(&other)));
+        let body2 = m.encode_prometheus();
+        assert!(
+            body2.contains("spot_ws_ping_rtt_ms 42"),
+            "second attach must not replace the original handle, got:\n{body2}"
         );
     }
 

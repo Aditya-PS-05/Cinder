@@ -381,6 +381,7 @@ async fn run(cfg: LiveCfg) -> Result<()> {
         builder = builder.pnl_guard(guard);
     }
 
+    let mut metrics_handle: Option<Arc<RunnerMetrics>> = None;
     let metrics_server = if let Some(mcfg) = cfg.metrics.as_ref() {
         let addr: std::net::SocketAddr = mcfg
             .listen
@@ -395,6 +396,7 @@ async fn run(cfg: LiveCfg) -> Result<()> {
             metrics.observe_kill_switch(ks);
         }
         builder = builder.metrics(Arc::clone(&metrics));
+        metrics_handle = Some(Arc::clone(&metrics));
         tracing::info!(addr = %actual, "metrics endpoint /metrics ready");
         Some(spawn_metrics_server(listener, metrics))
     } else {
@@ -461,6 +463,10 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     ws_cfg.ws_url = cfg.market.ws_url.clone();
     ws_cfg.rest_base = cfg.binance.rest_base.clone();
     let md_client = Arc::new(SpotStreamClient::new(ws_cfg, Arc::clone(&bus)));
+    if let Some(m) = metrics_handle.as_ref() {
+        m.attach_ws_ping_rtt(md_client.last_ping_rtt_handle());
+        m.attach_ws_resync_counter(md_client.resync_counter());
+    }
     let md_for_task = Arc::clone(&md_client);
     let md_task = tokio::spawn(async move { md_for_task.run().await });
 
