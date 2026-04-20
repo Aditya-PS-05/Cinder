@@ -362,6 +362,38 @@ impl<A: BinanceOrderApi> OrderEngine for BinanceLiveEngine<A> {
         self.symbol_by_cid.keys().cloned().collect()
     }
 
+    /// Kick off a venue-state resync for every cid the engine still
+    /// considers live. Each spawned task issues a `query_order` REST
+    /// call and pushes the ack (or a synthesized rejected report on
+    /// transport failure) through the same inbound channel
+    /// [`reconcile`](Self::reconcile) drains, so corrections land via
+    /// the usual path and go through the illegal-transition filter.
+    /// Synchronous: callers do not wait for results.
+    fn resync_open_orders(&mut self) {
+        for (cid, symbol) in self.symbol_by_cid.iter() {
+            let Some(spec) = self.specs.get(symbol).cloned() else {
+                continue;
+            };
+            let req = QueryOrderRequest {
+                symbol: spec.symbol.as_str().to_string(),
+                selector: OrderSelector::OrigClientOrderId(cid.as_str().to_string()),
+            };
+            let api = Arc::clone(&self.api);
+            let tx = self.tx.clone();
+            let cid_bg = cid.clone();
+            tokio::spawn(async move {
+                let report = match api.query_order(req).await {
+                    Ok(ack) => ack_to_report(&ack, &spec),
+                    Err(err) => ExecReport::rejected(
+                        cid_bg,
+                        format!("query_order transport failure: {err}"),
+                    ),
+                };
+                let _ = tx.send(report).await;
+            });
+        }
+    }
+
     fn reconcile(&mut self) -> Result<EngineStep, Self::Error> {
         let mut step = EngineStep::default();
         while let Ok(report) = self.rx.try_recv() {
@@ -419,6 +451,9 @@ mod tests {
         }
         fn push_cancel(&self, ack: OrderAck) {
             self.cancel_order.lock().unwrap().push_back(Ok(ack));
+        }
+        fn push_query(&self, ack: OrderAck) {
+            self.query_order.lock().unwrap().push_back(Ok(ack));
         }
     }
 
@@ -790,6 +825,71 @@ mod tests {
         assert_eq!(step.reports.len(), 3);
         assert_eq!(step.reports[2].status, OrderStatus::Filled);
         assert_eq!(eng.illegal_transitions(), 0);
+    }
+
+    #[tokio::test]
+    async fn resync_open_orders_surfaces_venue_state_via_reconcile() {
+        // Submit and drain an optimistic NEW so the cid enters
+        // symbol_by_cid, then push a terminal FILLED onto the
+        // `query_order` queue. resync_open_orders must spawn one
+        // query per open cid; reconcile then sees the FILLED and
+        // updates the cache + drops the cid from symbol_by_cid.
+        let api = Arc::new(QueuedApi::default());
+        api.push_new(ack("c-resync", "NEW", "0", "0"));
+        api.push_query(ack("c-resync", "FILLED", "0.001000", "65.00"));
+        let mut eng = BinanceLiveEngine::new(Arc::clone(&api), specs_map(), Venue::BINANCE, 8);
+
+        eng.submit(
+            new_limit_order("c-resync", Side::Buy, 6_500_000, 1_000),
+            Timestamp::default(),
+        )
+        .unwrap();
+
+        // Drain the optimistic NEW first.
+        for _ in 0..50 {
+            let step = eng.reconcile().unwrap();
+            if !step.reports.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(eng.open_cids(), vec![ClientOrderId::new("c-resync")]);
+
+        // Trigger the venue resync — synchronous; the query task runs
+        // in the background and lands its ack through the inbound
+        // channel that reconcile drains.
+        eng.resync_open_orders();
+
+        for _ in 0..50 {
+            let step = eng.reconcile().unwrap();
+            if let Some(r) = step
+                .reports
+                .iter()
+                .find(|r| r.status == OrderStatus::Filled)
+            {
+                assert_eq!(r.filled_qty, Qty(1_000));
+                assert_eq!(r.avg_price, Some(Price(6_500_000)));
+                assert!(
+                    eng.open_cids().is_empty(),
+                    "terminal resync clears open cid"
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected a FILLED report from the resync query");
+    }
+
+    #[tokio::test]
+    async fn resync_open_orders_is_noop_without_live_cids() {
+        // With no open cids and no canned responses, resync must not
+        // panic and must not produce any reports on the next reconcile.
+        let api = Arc::new(QueuedApi::default());
+        let mut eng = BinanceLiveEngine::new(Arc::clone(&api), specs_map(), Venue::BINANCE, 8);
+        eng.resync_open_orders();
+        tokio::task::yield_now().await;
+        let step = eng.reconcile().unwrap();
+        assert!(step.reports.is_empty());
     }
 
     #[tokio::test]

@@ -67,6 +67,11 @@ pub struct LiveSummary {
     /// the runner cleaned up, but the strategy's shutdown path is not
     /// trustworthy and should be fixed.
     pub trip_sweep_orphan_cancels: u64,
+    /// Cumulative number of [`OrderEngine::resync_open_orders`] ticks
+    /// the runner has fired against the engine. One increment per
+    /// resync-interval tick, independent of how many cids the engine
+    /// actually queries. Zero when the resync interval is disabled.
+    pub venue_resyncs: u64,
     /// Per-venue running-stats of `local_ts - exchange_ts` observed on
     /// the market-data feed. Mirrors the internal [`ClockSkewTracker`]
     /// into the summary stream so dashboards + post-run asserts can
@@ -83,6 +88,13 @@ pub struct LiveRunner<E: OrderEngine> {
     rx: mpsc::Receiver<MarketEvent>,
     shutdown: Arc<Notify>,
     reconcile_interval: Duration,
+    /// Cadence at which [`OrderEngine::resync_open_orders`] is called
+    /// to reconcile cached state against the venue's authoritative
+    /// order book via out-of-band REST queries. `Duration::ZERO`
+    /// disables the tick. Kept independent of the reconcile tick: the
+    /// former drains already-delivered updates; this one re-requests
+    /// state we might not know we've lost.
+    resync_interval: Duration,
     summary_tx: Option<broadcast::Sender<LiveSummary>>,
     summary_interval: Duration,
     /// Cadence at which [`Strategy::on_timer`] fires, independent of
@@ -205,6 +217,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             strategy,
             rx,
             reconcile_interval: Duration::from_millis(100),
+            resync_interval: Duration::ZERO,
             summary_interval: Duration::from_secs(0),
             summary_capacity: 0,
             timer_interval: Duration::ZERO,
@@ -295,6 +308,15 @@ impl<E: OrderEngine> LiveRunner<E> {
             Some(i)
         };
 
+        let mut resync_ticker = if self.resync_interval.is_zero() {
+            None
+        } else {
+            let mut i = tokio::time::interval(self.resync_interval);
+            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            i.tick().await; // burn the immediate fire
+            Some(i)
+        };
+
         loop {
             tokio::select! {
                 biased;
@@ -323,6 +345,18 @@ impl<E: OrderEngine> LiveRunner<E> {
                     }
                 } => {
                     self.handle_timer_tick().await;
+                }
+                _ = async {
+                    match resync_ticker.as_mut() {
+                        Some(i) => { i.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.engine.resync_open_orders();
+                    self.summary.venue_resyncs += 1;
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.observe_live(&self.summary);
+                    }
                 }
                 _ = async {
                     match summary_ticker.as_mut() {
@@ -862,6 +896,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     strategy: Box<dyn Strategy>,
     rx: mpsc::Receiver<MarketEvent>,
     reconcile_interval: Duration,
+    resync_interval: Duration,
     summary_interval: Duration,
     summary_capacity: usize,
     timer_interval: Duration,
@@ -880,6 +915,17 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
     pub fn reconcile_interval(mut self, d: Duration) -> Self {
         self.reconcile_interval = d;
+        self
+    }
+
+    /// Cadence at which the runner calls
+    /// [`OrderEngine::resync_open_orders`] to re-query the venue's
+    /// authoritative order state and correct any cached divergence.
+    /// `Duration::ZERO` (the default) disables the tick entirely.
+    /// Useful against connectors where a missed user-data-stream frame
+    /// would otherwise leave the engine's cache stale indefinitely.
+    pub fn resync_interval(mut self, d: Duration) -> Self {
+        self.resync_interval = d;
         self
     }
 
@@ -1011,6 +1057,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             rx: self.rx,
             shutdown,
             reconcile_interval: self.reconcile_interval,
+            resync_interval: self.resync_interval,
             summary_tx,
             summary_interval: self.summary_interval,
             timer_interval: self.timer_interval,
@@ -2473,5 +2520,52 @@ mod tests {
         runner.record_venue_error(Instant::now());
         // No switch attached — nothing to observe. The fact that this
         // compiles + runs without panicking is the assertion.
+    }
+
+    #[tokio::test]
+    async fn resync_interval_ticks_increment_venue_resyncs_counter() {
+        // With no market events on the channel the runner only makes
+        // progress via its tickers. A short resync interval + a brief
+        // sleep must produce one or more resync ticks reflected in the
+        // summary counter.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(50))
+            .resync_interval(Duration::from_millis(20))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert!(
+            summary.venue_resyncs >= 1,
+            "expected at least one resync tick, got {}",
+            summary.venue_resyncs
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_interval_disabled_by_default() {
+        // Zero interval is the default; the summary counter must stay
+        // at zero even across plenty of reconcile ticks.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(summary.venue_resyncs, 0);
     }
 }

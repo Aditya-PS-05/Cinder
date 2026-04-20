@@ -84,6 +84,19 @@ pub trait OrderEngine {
     fn open_cids(&self) -> Vec<ClientOrderId> {
         Vec::new()
     }
+
+    /// Trigger an out-of-band resync against the venue's authoritative
+    /// order state. Live engines fire an async query per open cid; the
+    /// resulting [`ExecReport`]s land in the same queue that
+    /// [`reconcile`](Self::reconcile) drains, so correction flows
+    /// through the normal path. Paper engines have no venue to query
+    /// and return immediately.
+    ///
+    /// Semantics are "best effort, eventually consistent" — the method
+    /// is synchronous; callers do not wait for the query results.
+    /// Corrections arrive on the next `reconcile` tick that runs after
+    /// the HTTP round-trip completes.
+    fn resync_open_orders(&mut self) {}
 }
 
 impl<S: Strategy> OrderEngine for PaperEngine<S> {
