@@ -97,6 +97,40 @@ pub trait OrderEngine {
     /// Corrections arrive on the next `reconcile` tick that runs after
     /// the HTTP round-trip completes.
     fn resync_open_orders(&mut self) {}
+
+    /// Cancel an open order and immediately submit a replacement.
+    ///
+    /// The default is a non-atomic compose of [`cancel`](Self::cancel)
+    /// then [`submit`](Self::submit), with STOP-on-failure semantics: if
+    /// the cancel leg returns [`ts_core::OrderStatus::Rejected`] the new
+    /// order is **not** submitted, so the caller can't end up with
+    /// double exposure when the first leg couldn't be retired. Callers
+    /// that want post-failure submit (e.g. the venue rejected cancel
+    /// because the order already filled) should inspect the returned
+    /// [`CancelReplaceReport`] and re-issue explicitly.
+    ///
+    /// Venue-native cancel-replace primitives (Binance's `POST
+    /// /api/v3/order/cancelReplace`) can override this to get an
+    /// atomic round-trip.
+    fn cancel_replace(
+        &mut self,
+        old_cid: &ClientOrderId,
+        new_order: NewOrder,
+        now: Timestamp,
+    ) -> Result<crate::CancelReplaceReport, Self::Error> {
+        let cancel = self.cancel(old_cid)?;
+        if matches!(cancel.status, ts_core::OrderStatus::Rejected) {
+            return Ok(crate::CancelReplaceReport {
+                cancel,
+                submit: None,
+            });
+        }
+        let submit = self.submit(new_order, now)?;
+        Ok(crate::CancelReplaceReport {
+            cancel,
+            submit: Some(submit),
+        })
+    }
 }
 
 impl<S: Strategy> OrderEngine for PaperEngine<S> {
@@ -256,5 +290,66 @@ mod tests {
             r.status,
             OrderStatus::Filled | OrderStatus::PartiallyFilled
         ));
+    }
+
+    fn resting_limit_buy(cid: &str, price: i64) -> NewOrder {
+        NewOrder {
+            cid: ClientOrderId::new(cid),
+            venue: venue(),
+            symbol: sym(),
+            side: Side::Buy,
+            kind: OrderKind::Limit,
+            tif: TimeInForce::Gtc,
+            qty: Qty(1),
+            price: Some(Price(price)),
+            ts: Timestamp::default(),
+        }
+    }
+
+    #[test]
+    fn cancel_replace_happy_path_retires_old_and_submits_new() {
+        let mut e = engine();
+        e.apply_event(&snapshot(100, 110, 1)).unwrap();
+        // Seed a resting limit — price below best-bid keeps it live.
+        let first =
+            OrderEngine::submit(&mut e, resting_limit_buy("r1", 50), Timestamp::default()).unwrap();
+        assert_eq!(first.status, OrderStatus::New);
+        assert!(e.live_orders().contains_key(&ClientOrderId::new("r1")));
+
+        let report = OrderEngine::cancel_replace(
+            &mut e,
+            &ClientOrderId::new("r1"),
+            resting_limit_buy("r2", 55),
+            Timestamp::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.cancel.status, OrderStatus::Canceled);
+        let submit = report.submit.expect("submit leg fires on cancel success");
+        assert_eq!(submit.status, OrderStatus::New);
+        assert!(!e.live_orders().contains_key(&ClientOrderId::new("r1")));
+        assert!(e.live_orders().contains_key(&ClientOrderId::new("r2")));
+    }
+
+    #[test]
+    fn cancel_replace_stops_when_cancel_leg_rejected() {
+        let mut e = engine();
+        e.apply_event(&snapshot(100, 110, 1)).unwrap();
+
+        let report = OrderEngine::cancel_replace(
+            &mut e,
+            &ClientOrderId::new("never-existed"),
+            resting_limit_buy("r3", 55),
+            Timestamp::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.cancel.status, OrderStatus::Rejected);
+        assert!(
+            report.submit.is_none(),
+            "STOP-on-failure: no new order when cancel leg rejects"
+        );
+        // And critically: the replacement cid must not be live.
+        assert!(!e.live_orders().contains_key(&ClientOrderId::new("r3")));
     }
 }

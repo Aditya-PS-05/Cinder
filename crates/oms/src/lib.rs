@@ -60,6 +60,20 @@ pub struct EngineStep {
     pub fills: Vec<Fill>,
 }
 
+/// Result of an [`OrderEngine::cancel_replace`] call.
+///
+/// `cancel` is the engine's response to the cancel leg (optimistic on
+/// live engines, terminal on paper). `submit` is the new-order leg's
+/// response: present on success, `None` when the cancel leg returned
+/// `OrderStatus::Rejected` and the engine's policy was to skip the
+/// submit (default: STOP-on-failure — don't create a second exposure
+/// when the first couldn't be retired).
+#[derive(Debug, Clone)]
+pub struct CancelReplaceReport {
+    pub cancel: ExecReport,
+    pub submit: Option<ExecReport>,
+}
+
 pub struct PaperEngine<S: Strategy> {
     cfg: EngineConfig,
     book: OrderBook,
