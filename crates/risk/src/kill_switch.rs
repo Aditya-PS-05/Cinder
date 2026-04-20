@@ -47,6 +47,12 @@ pub enum TripReason {
     /// the venue's — either way, latency-sensitive logic (TTL, window
     /// checks, cancel-before-expiry) is unreliable and we halt.
     ClockSkew,
+    /// Transport-level errors against a venue (5xx, timeouts, auth
+    /// rejections) exceeded the configured rate. Distinct from
+    /// `RejectRate`, which counts order-level rejects; this fires
+    /// when the venue itself looks unhealthy or our credentials are
+    /// wrong, so retrying makes the problem worse.
+    VenueErrors,
 }
 
 impl TripReason {
@@ -59,6 +65,7 @@ impl TripReason {
             TripReason::DailyLoss => 5,
             TripReason::FeedStaleness => 6,
             TripReason::ClockSkew => 7,
+            TripReason::VenueErrors => 8,
         }
     }
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -70,6 +77,7 @@ impl TripReason {
             5 => Some(TripReason::DailyLoss),
             6 => Some(TripReason::FeedStaleness),
             7 => Some(TripReason::ClockSkew),
+            8 => Some(TripReason::VenueErrors),
             _ => None,
         }
     }

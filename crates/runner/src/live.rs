@@ -37,7 +37,7 @@ use ts_oms::OrderEngine;
 use ts_pnl::Accountant;
 use ts_risk::{
     ClockSkewGuard, ClockSkewSnapshot, ClockSkewTracker, KillSwitch, PnlGuard, RiskConfig,
-    RiskEngine, StalenessGuard,
+    RiskEngine, StalenessGuard, VenueErrorGuard,
 };
 use ts_strategy::{Strategy, StrategyAction};
 
@@ -153,6 +153,12 @@ pub struct LiveRunner<E: OrderEngine> {
     /// [`ts_risk::TripReason::ClockSkew`] so latency-sensitive logic
     /// does not operate on bogus timing.
     clock_skew_guard: Option<ClockSkewGuard>,
+    /// Tracks transport-level venue errors (5xx, timeouts, auth
+    /// failures). Callers feed the guard via
+    /// [`LiveRunner::record_venue_error`]; a breach trips the attached
+    /// [`KillSwitch`] with [`ts_risk::TripReason::VenueErrors`]. No-op
+    /// when no kill switch is attached.
+    venue_error_guard: Option<VenueErrorGuard>,
     /// Per-venue running-stats view of `local_ts - exchange_ts`. Folds
     /// every event into a [`ClockSkewTracker`] so operators see the
     /// steady-state drift (mean, sample stddev, max-abs) alongside the
@@ -211,6 +217,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             intent_log: None,
             staleness_guard: None,
             clock_skew_guard: None,
+            venue_error_guard: None,
         }
     }
 
@@ -222,6 +229,34 @@ impl<E: OrderEngine> LiveRunner<E> {
         &self,
     ) -> impl Iterator<Item = (ts_core::Venue, ClockSkewSnapshot)> + '_ {
         self.clock_skew_tracker.iter()
+    }
+
+    /// Feed a transport-level venue error into the configured
+    /// [`VenueErrorGuard`]. The runner itself does not own the HTTP
+    /// client — callers (the connector task, the reconcile worker)
+    /// invoke this when a request fails with 5xx, a timeout, or a
+    /// transport error so the guard can count it against its window.
+    /// A breach trips the attached [`KillSwitch`]. No-op when either
+    /// the guard or the switch is unattached — counting errors with no
+    /// downstream to halt is just bookkeeping.
+    pub fn record_venue_error(&mut self, now: Instant) {
+        let Some(guard) = self.venue_error_guard.as_mut() else {
+            return;
+        };
+        if let Some(breach) = guard.record_error(now) {
+            if let Some(ks) = self.kill_switch.as_ref() {
+                if !ks.tripped() {
+                    warn!(
+                        ?breach,
+                        "live-runner: venue-error guard breach; tripping kill switch"
+                    );
+                    ks.trip(breach.to_trip_reason());
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.observe_kill_switch(ks);
+                    }
+                }
+            }
+        }
     }
 
     /// Drive the runner until the event channel closes or the handle
@@ -839,6 +874,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     intent_log: Option<IntentLogWriter>,
     staleness_guard: Option<StalenessGuard>,
     clock_skew_guard: Option<ClockSkewGuard>,
+    venue_error_guard: Option<VenueErrorGuard>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -944,6 +980,19 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Attach a [`VenueErrorGuard`] to trip the kill switch when
+    /// transport-level venue errors (5xx, timeouts, auth failures)
+    /// spike above a configured rate. The runner does not observe the
+    /// venue transport itself; callers feed the guard via
+    /// [`LiveRunner::record_venue_error`] from the connector task.
+    /// A breach trips the attached [`KillSwitch`] with
+    /// [`ts_risk::TripReason::VenueErrors`]. No-op when no kill switch
+    /// is attached.
+    pub fn venue_error_guard(mut self, guard: VenueErrorGuard) -> Self {
+        self.venue_error_guard = Some(guard);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -979,6 +1028,7 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             intent_log: self.intent_log,
             staleness_guard: self.staleness_guard,
             clock_skew_guard: self.clock_skew_guard,
+            venue_error_guard: self.venue_error_guard,
             clock_skew_tracker: ClockSkewTracker::new(),
         };
         (runner, handle)
@@ -2366,5 +2416,62 @@ mod tests {
             !ks.tripped(),
             "feed under max_idle must never trip the switch"
         );
+    }
+
+    #[tokio::test]
+    async fn venue_error_guard_trips_kill_switch_on_error_burst() {
+        use ts_risk::{KillSwitch, TripReason, VenueErrorGuard, VenueErrorGuardConfig};
+        // 2 errors per 1 s window: the third call inside the window
+        // must breach and trip the kill switch.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = VenueErrorGuard::new(VenueErrorGuardConfig {
+            max_errors: Some(2),
+            window: Duration::from_secs(1),
+        });
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (mut runner, _handle) = LiveRunner::builder(engine, maker(), rx)
+            .kill_switch(Arc::clone(&ks))
+            .venue_error_guard(guard)
+            .build();
+
+        let t0 = Instant::now();
+        runner.record_venue_error(t0);
+        runner.record_venue_error(t0 + Duration::from_millis(10));
+        assert!(!ks.tripped(), "two errors must not trip yet");
+
+        runner.record_venue_error(t0 + Duration::from_millis(20));
+        assert!(
+            ks.tripped(),
+            "third error inside the window must trip the kill switch"
+        );
+        assert_eq!(ks.reason(), Some(TripReason::VenueErrors));
+    }
+
+    #[tokio::test]
+    async fn venue_error_guard_is_noop_without_kill_switch() {
+        // A guard without a kill switch has no downstream to signal;
+        // the breach is counted but nothing tips over. Proves the
+        // integration is fail-safe if an operator forgets the switch.
+        use ts_risk::{VenueErrorGuard, VenueErrorGuardConfig};
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let guard = VenueErrorGuard::new(VenueErrorGuardConfig {
+            max_errors: Some(0),
+            window: Duration::from_secs(1),
+        });
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (mut runner, _handle) = LiveRunner::builder(engine, maker(), rx)
+            .venue_error_guard(guard)
+            .build();
+
+        runner.record_venue_error(Instant::now());
+        // No switch attached — nothing to observe. The fact that this
+        // compiles + runs without panicking is the assertion.
     }
 }
