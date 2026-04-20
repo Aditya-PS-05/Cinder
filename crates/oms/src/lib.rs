@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use ts_book::{BookError, OrderBook};
 use ts_core::{
     ClientOrderId, ExecReport, Fill, MarketEvent, MarketPayload, NewOrder, OrderKind, OrderStatus,
-    Price, Qty, Side, Symbol, Timestamp, Venue,
+    Price, Qty, Side, Symbol, TimeInForce, Timestamp, Venue,
 };
 use ts_paper::PaperExecutor;
 use ts_risk::RiskEngine;
@@ -209,6 +209,18 @@ impl<S: Strategy> PaperEngine<S> {
             self.strategy.on_exec_report(&r);
             return r;
         }
+        // PostOnly must never take liquidity. Pre-screen against the
+        // current top of book: a buy at price >= best_ask or a sell at
+        // price <= best_bid would cross, so reject before the executor
+        // can fill a single share. Venues enforce this server-side
+        // (Binance's LIMIT_MAKER) — doing it here keeps paper in
+        // lockstep with live and lets strategies see the same rejection
+        // reason on both sides.
+        if let Some(reason) = post_only_cross_reason(&order, &self.book) {
+            let r = ExecReport::rejected(order.cid.clone(), reason);
+            self.strategy.on_exec_report(&r);
+            return r;
+        }
         let ref_price = match self.reference_price(&order) {
             Some(p) => p,
             None => {
@@ -272,6 +284,50 @@ impl<S: Strategy> PaperEngine<S> {
                     .or(self.cfg.notional_fallback_price)
             }
         }
+    }
+}
+
+/// Decide whether a PostOnly order should be rejected pre-submit.
+/// Returns `None` when the order is not PostOnly or does not cross the
+/// current book; returns `Some(reason)` when the order would take
+/// liquidity and must be rejected.
+///
+/// Handles only [`OrderKind::Limit`]; a PostOnly market order is a
+/// contradiction in terms — market orders *always* take liquidity — so
+/// we reject that combo up front with a distinct reason so strategies
+/// can't accidentally rely on it for "aggressive post-only" that
+/// doesn't exist. Missing price on a Limit order is left for
+/// [`RiskEngine::check`] to surface with its existing error.
+fn post_only_cross_reason(order: &NewOrder, book: &OrderBook) -> Option<String> {
+    if !matches!(order.tif, TimeInForce::PostOnly) {
+        return None;
+    }
+    if matches!(order.kind, OrderKind::Market) {
+        return Some("post-only requires a limit price".to_string());
+    }
+    let limit = order.price?;
+    match order.side {
+        Side::Buy => book.best_ask().and_then(|lvl| {
+            if limit.0 >= lvl.price.0 {
+                Some(format!(
+                    "post-only would cross: buy at {} >= best ask {}",
+                    limit.0, lvl.price.0
+                ))
+            } else {
+                None
+            }
+        }),
+        Side::Sell => book.best_bid().and_then(|lvl| {
+            if limit.0 <= lvl.price.0 {
+                Some(format!(
+                    "post-only would cross: sell at {} <= best bid {}",
+                    limit.0, lvl.price.0
+                ))
+            } else {
+                None
+            }
+        }),
+        Side::Unknown => None,
     }
 }
 
@@ -768,5 +824,83 @@ mod tests {
         // Both fresh quotes should have been re-placed.
         assert_eq!(places.len(), 2);
         assert_eq!(e.risk().position(&sym()), 3);
+    }
+
+    /// No-op strategy: ignores every callback. Lets PostOnly tests
+    /// observe `live_orders` without an auto-quoting maker polluting it.
+    struct Passive;
+    impl Strategy for Passive {
+        fn on_book_update(&mut self, _now: Timestamp, _book: &OrderBook) -> Vec<StrategyAction> {
+            Vec::new()
+        }
+        fn on_fill(&mut self, _fill: &Fill) {}
+    }
+
+    fn post_only_limit(side: Side, price: i64, qty: i64, cid: &'static str) -> NewOrder {
+        NewOrder {
+            cid: ClientOrderId::new(cid),
+            venue: venue(),
+            symbol: sym(),
+            side,
+            kind: OrderKind::Limit,
+            tif: TimeInForce::PostOnly,
+            qty: Qty(qty),
+            price: Some(Price(price)),
+            ts: Timestamp::default(),
+        }
+    }
+
+    #[test]
+    fn post_only_buy_crossing_best_ask_is_rejected() {
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), Passive);
+        e.apply_event(&snapshot_event(vec![lvl(99, 5)], vec![lvl(100, 5)], 1))
+            .unwrap();
+        let report = e
+            .submit(
+                post_only_limit(Side::Buy, 100, 1, "po-buy"),
+                Timestamp::default(),
+            )
+            .unwrap();
+        assert_eq!(report.status, OrderStatus::Rejected);
+        assert!(report
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("post-only would cross"));
+        assert!(e.live_orders().is_empty());
+        assert_eq!(e.risk().open_orders(), 0);
+    }
+
+    #[test]
+    fn post_only_sell_crossing_best_bid_is_rejected() {
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), Passive);
+        e.apply_event(&snapshot_event(vec![lvl(100, 5)], vec![lvl(101, 5)], 1))
+            .unwrap();
+        let report = e
+            .submit(
+                post_only_limit(Side::Sell, 100, 1, "po-sell"),
+                Timestamp::default(),
+            )
+            .unwrap();
+        assert_eq!(report.status, OrderStatus::Rejected);
+        assert!(report
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("post-only would cross"));
+        assert!(e.live_orders().is_empty());
+    }
+
+    #[test]
+    fn post_only_limit_not_crossing_accepts_as_resting_maker() {
+        let mut e = PaperEngine::new(engine_cfg(), RiskConfig::permissive(), Passive);
+        e.apply_event(&snapshot_event(vec![lvl(100, 5)], vec![lvl(110, 5)], 1))
+            .unwrap();
+        let cid = ClientOrderId::new("po-rest");
+        let order = post_only_limit(Side::Buy, 99, 1, "po-rest");
+        let report = e.submit(order, Timestamp::default()).unwrap();
+        assert_eq!(report.status, OrderStatus::New);
+        assert!(report.fills.is_empty());
+        assert!(e.live_orders().contains_key(&cid));
     }
 }

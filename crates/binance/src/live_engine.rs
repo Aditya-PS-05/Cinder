@@ -178,13 +178,23 @@ impl<A: BinanceOrderApi> BinanceLiveEngine<A> {
         let spec = self.spec_for(&order.symbol)?;
         let side = binance_side(order.side)?;
         let qty_str = order.qty.to_string(spec.qty_scale);
-        let (order_type, tif, price) = match order.kind {
-            OrderKind::Limit => (
-                OrderType::Limit,
-                Some(binance_tif(order.tif)),
+        // PostOnly on Binance spot is the LIMIT_MAKER order type, not a
+        // TIF variant — the venue rejects the order if any part would
+        // take liquidity and never carries a `timeInForce` field.
+        // Everything else (GTC/IOC/FOK) rides as a LIMIT with the
+        // matching TIF string.
+        let (order_type, tif, price) = match (order.kind, order.tif) {
+            (OrderKind::Limit, TimeInForce::PostOnly) => (
+                OrderType::LimitMaker,
+                None,
                 order.price.map(|p| p.to_string(spec.price_scale)),
             ),
-            OrderKind::Market => (OrderType::Market, None, None),
+            (OrderKind::Limit, _) => (
+                OrderType::Limit,
+                binance_tif(order.tif),
+                order.price.map(|p| p.to_string(spec.price_scale)),
+            ),
+            (OrderKind::Market, _) => (OrderType::Market, None, None),
         };
         Ok(NewOrderRequest {
             symbol: spec.symbol.as_str().to_string(),
@@ -207,11 +217,16 @@ fn binance_side(side: Side) -> Result<BinanceSide, LiveEngineError> {
     }
 }
 
-fn binance_tif(tif: TimeInForce) -> BinanceTimeInForce {
+/// Return the Binance `timeInForce` string for a non-PostOnly TIF, or
+/// `None` when the caller supplies `TimeInForce::PostOnly` (which
+/// should already have been routed to `OrderType::LimitMaker` by
+/// [`BinanceLiveEngine::to_new_order_request`]).
+fn binance_tif(tif: TimeInForce) -> Option<BinanceTimeInForce> {
     match tif {
-        TimeInForce::Gtc => BinanceTimeInForce::Gtc,
-        TimeInForce::Ioc => BinanceTimeInForce::Ioc,
-        TimeInForce::Fok => BinanceTimeInForce::Fok,
+        TimeInForce::Gtc => Some(BinanceTimeInForce::Gtc),
+        TimeInForce::Ioc => Some(BinanceTimeInForce::Ioc),
+        TimeInForce::Fok => Some(BinanceTimeInForce::Fok),
+        TimeInForce::PostOnly => None,
     }
 }
 
@@ -548,6 +563,38 @@ mod tests {
         assert_eq!(req.price.as_deref(), Some("65000"));
         assert_eq!(req.quantity.as_deref(), Some("0.001"));
         assert_eq!(req.new_client_order_id.as_deref(), Some("abc"));
+    }
+
+    /// PostOnly limit routes to the `LIMIT_MAKER` order type with no
+    /// `timeInForce` field — Binance's spot API rejects a
+    /// `timeInForce` on `LIMIT_MAKER`, so sending one would bounce
+    /// the order server-side. The price and qty encodings stay
+    /// identical to a GTC limit; only the type and TIF differ.
+    #[test]
+    fn to_new_order_request_maps_post_only_to_limit_maker_without_tif() {
+        let api = Arc::new(QueuedApi::default());
+        let eng = BinanceLiveEngine::new(api, specs_map(), Venue::BINANCE, 8);
+        let mut order = new_limit_order("abc", Side::Buy, 6_500_000, 1_000);
+        order.tif = TimeInForce::PostOnly;
+        let req = eng.to_new_order_request(&order).unwrap();
+        assert_eq!(req.order_type, OrderType::LimitMaker);
+        assert_eq!(req.time_in_force, None);
+        // Price + qty still rendered at instrument scale.
+        assert_eq!(req.price.as_deref(), Some("65000"));
+        assert_eq!(req.quantity.as_deref(), Some("0.001"));
+    }
+
+    /// Cross-check the free `binance_tif` helper directly: each
+    /// non-PostOnly variant yields the matching Binance string, and
+    /// PostOnly collapses to `None` so callers that forget to route
+    /// it through `LIMIT_MAKER` see a missing field rather than a
+    /// wrong TIF.
+    #[test]
+    fn binance_tif_returns_none_only_for_post_only() {
+        assert_eq!(binance_tif(TimeInForce::Gtc), Some(BinanceTimeInForce::Gtc));
+        assert_eq!(binance_tif(TimeInForce::Ioc), Some(BinanceTimeInForce::Ioc));
+        assert_eq!(binance_tif(TimeInForce::Fok), Some(BinanceTimeInForce::Fok));
+        assert_eq!(binance_tif(TimeInForce::PostOnly), None);
     }
 
     #[test]

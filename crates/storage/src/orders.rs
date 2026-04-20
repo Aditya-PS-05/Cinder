@@ -48,6 +48,7 @@ pub fn tif_to_pg(t: TimeInForce) -> &'static str {
         TimeInForce::Gtc => "gtc",
         TimeInForce::Ioc => "ioc",
         TimeInForce::Fok => "fok",
+        TimeInForce::PostOnly => "post_only",
     }
 }
 
@@ -338,9 +339,16 @@ mod tests {
 
     #[test]
     fn tif_labels_match_schema_enum() {
+        // Every variant maps to a label present in the
+        // `time_in_force` Postgres enum (see
+        // `infra/migrations/postgres/V002__orders_and_fills.sql` and
+        // `V004__time_in_force_post_only.sql`). Adding a variant to
+        // `ts_core::TimeInForce` without a matching migration would
+        // break inserts at runtime; this pin catches the omission.
         assert_eq!(tif_to_pg(TimeInForce::Gtc), "gtc");
         assert_eq!(tif_to_pg(TimeInForce::Ioc), "ioc");
         assert_eq!(tif_to_pg(TimeInForce::Fok), "fok");
+        assert_eq!(tif_to_pg(TimeInForce::PostOnly), "post_only");
     }
 
     #[test]

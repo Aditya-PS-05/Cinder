@@ -40,6 +40,16 @@ pub enum TimeInForce {
     Ioc,
     /// Fill-or-kill: either fill in full or reject outright.
     Fok,
+    /// Post-only (aka maker-only): reject the order outright if any
+    /// part of it would immediately cross the opposite side and take
+    /// liquidity. Guarantees the resulting order rests as a maker or
+    /// does not exist at all — useful for makers who care about fee
+    /// tier, queue position, or the guarantee that they never
+    /// accidentally lift the offer on a missed cancel. On Binance
+    /// spot, this maps to the `LIMIT_MAKER` order type rather than a
+    /// TIF string; in the paper engine, it is enforced pre-submit by
+    /// comparing the limit price against top-of-book.
+    PostOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -141,7 +141,13 @@ fn determine_status(order: &NewOrder, filled: i64, remaining: i64) -> OrderStatu
         return OrderStatus::Canceled;
     }
     match order.tif {
-        TimeInForce::Gtc => {
+        // PostOnly orders are pre-screened for crossing at the
+        // PaperEngine layer and never reach this executor if they
+        // would cross. If one does slip through (e.g. a test calls
+        // the executor directly against a crossing book) we fall
+        // back to GTC resting semantics — but the strategy-visible
+        // outcome has already been rejected upstream.
+        TimeInForce::Gtc | TimeInForce::PostOnly => {
             if filled > 0 {
                 OrderStatus::PartiallyFilled
             } else {
