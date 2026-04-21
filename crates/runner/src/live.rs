@@ -198,6 +198,20 @@ pub struct LiveRunner<E: OrderEngine> {
     /// startup, so firing against the counter's startup value would be
     /// pure waste.
     last_reconnect_seen: u64,
+    /// Shared handle to a transport-level venue-error counter (e.g. a
+    /// connector's cumulative 5xx / timeout / auth-failure tally). When
+    /// attached, every reconcile tick polls it and feeds each new error
+    /// into [`Self::record_venue_error`] exactly once — the connector
+    /// can't reach `&mut LiveRunner` across tasks, so this is the
+    /// thread-safe intake. One `record_venue_error` call fires per new
+    /// error so the [`VenueErrorGuard`]'s sliding-window count tracks
+    /// the real rate, not a dirty-bit.
+    venue_error_counter: Option<Arc<AtomicU64>>,
+    /// High-water mark of [`Self::venue_error_counter`]. Seeded at build
+    /// time from the counter's current value so errors that happened
+    /// before the runner started don't count toward the guard — the
+    /// connector may have been running for a while before we attached.
+    last_venue_error_seen: u64,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -252,6 +266,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             clock_skew_guard: None,
             venue_error_guard: None,
             reconnect_counter: None,
+            venue_error_counter: None,
         }
     }
 
@@ -359,6 +374,7 @@ impl<E: OrderEngine> LiveRunner<E> {
                 _ = reconcile.tick() => {
                     self.drain_reconcile().await;
                     self.maybe_reconnect_resync();
+                    self.maybe_record_venue_errors();
                 }
                 _ = async {
                     match timer_ticker.as_mut() {
@@ -934,6 +950,31 @@ impl<E: OrderEngine> LiveRunner<E> {
             }
         }
     }
+
+    /// Poll the attached transport-error counter and feed each new
+    /// increment into [`Self::record_venue_error`]. One call per new
+    /// error keeps the [`VenueErrorGuard`]'s sliding-window count
+    /// accurate — a single "dirty bit" call would under-count rapid
+    /// bursts that happened between two reconcile ticks and let the
+    /// guard miss a breach. Errors are stamped with `Instant::now()`;
+    /// the true per-error timestamp is lost, but the guard's window is
+    /// coarse enough (seconds) that one-reconcile-tick worth of drift
+    /// is noise.
+    fn maybe_record_venue_errors(&mut self) {
+        let Some(counter) = self.venue_error_counter.as_ref() else {
+            return;
+        };
+        let current = counter.load(Ordering::Relaxed);
+        if current <= self.last_venue_error_seen {
+            return;
+        }
+        let delta = current - self.last_venue_error_seen;
+        self.last_venue_error_seen = current;
+        let now = Instant::now();
+        for _ in 0..delta {
+            self.record_venue_error(now);
+        }
+    }
 }
 
 pub struct LiveRunnerBuilder<E: OrderEngine> {
@@ -956,6 +997,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     clock_skew_guard: Option<ClockSkewGuard>,
     venue_error_guard: Option<VenueErrorGuard>,
     reconnect_counter: Option<Arc<AtomicU64>>,
+    venue_error_counter: Option<Arc<AtomicU64>>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -1101,6 +1143,19 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Wire a transport-level venue-error counter (monotone
+    /// `Arc<AtomicU64>`) into the runner. Each reconcile tick reads the
+    /// counter, and for every new increment since the previous poll
+    /// feeds one [`LiveRunner::record_venue_error`] call with
+    /// `Instant::now()`. Lets connector tasks (which can't reach
+    /// `&mut LiveRunner`) still drive the attached [`VenueErrorGuard`]
+    /// without a cross-thread callback. No-op when the counter never
+    /// advances — a healthy transport costs one atomic load per tick.
+    pub fn venue_error_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.venue_error_counter = Some(counter);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -1145,6 +1200,12 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0),
             reconnect_counter: self.reconnect_counter,
+            last_venue_error_seen: self
+                .venue_error_counter
+                .as_ref()
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            venue_error_counter: self.venue_error_counter,
         };
         (runner, handle)
     }
@@ -2692,6 +2753,85 @@ mod tests {
         assert_eq!(
             summary.venue_resyncs, 0,
             "no counter advance → no resync ticks"
+        );
+    }
+
+    #[tokio::test]
+    async fn venue_error_counter_advances_trip_kill_switch_via_guard() {
+        use ts_risk::{KillSwitch, TripReason, VenueErrorGuard, VenueErrorGuardConfig};
+        // Connector-style counter: the runner polls it each reconcile
+        // tick and feeds each new increment into the guard. With the
+        // guard set to 1-per-1s, a burst of 3 increments before the
+        // first poll must still cross the threshold and trip.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = VenueErrorGuard::new(VenueErrorGuardConfig {
+            max_errors: Some(1),
+            window: Duration::from_secs(1),
+        });
+
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .venue_error_guard(guard)
+            .venue_error_counter(Arc::clone(&counter))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        // Let one reconcile tick see the counter at 0 (baseline = 0,
+        // no feed into the guard), then burst three errors.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        counter.store(3, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(ks.tripped(), "3 errors ≫ 1 must trip the kill switch");
+        assert_eq!(ks.reason(), Some(TripReason::VenueErrors));
+    }
+
+    #[tokio::test]
+    async fn venue_error_counter_startup_value_is_snapshotted_not_replayed() {
+        use ts_risk::{KillSwitch, VenueErrorGuard, VenueErrorGuardConfig};
+        // A connector that's been running before the runner attached
+        // will expose a non-zero counter at build time. Those pre-attach
+        // errors must not be replayed — the guard only cares about
+        // errors that happen while we're quoting. Startup value is the
+        // high-water baseline; only post-build advances feed the guard.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let ks = Arc::new(KillSwitch::default());
+        let guard = VenueErrorGuard::new(VenueErrorGuardConfig {
+            max_errors: Some(1),
+            window: Duration::from_secs(1),
+        });
+
+        // Pre-existing errors on the counter that predate the runner.
+        let counter = Arc::new(AtomicU64::new(100));
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .kill_switch(Arc::clone(&ks))
+            .venue_error_guard(guard)
+            .venue_error_counter(Arc::clone(&counter))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        handle.shutdown();
+        let _ = task.await.unwrap();
+
+        assert!(
+            !ks.tripped(),
+            "pre-attach counter value must not feed the guard"
         );
     }
 }
