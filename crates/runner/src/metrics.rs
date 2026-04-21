@@ -195,6 +195,14 @@ pub struct RunnerMetrics {
     /// `ts_quote_suppressions_total{reason="price"}`.
     quote_suppressions_price: AtomicU64,
 
+    /// Cumulative count of `Place` actions the strategy has emitted —
+    /// the positive complement of [`Self::quote_suppressions_cap`] et
+    /// al. Sourced from [`ts_strategy::Strategy::quotes_posted`]. Lets
+    /// dashboards plot posted-vs-suppressed ratios instead of just
+    /// counting gate breaks in isolation. Surfaces as
+    /// `ts_quotes_posted_total`.
+    quotes_posted: AtomicU64,
+
     /// Per-symbol PnL/position gauges. Lazily populated on first
     /// observation per symbol; the `Mutex` guards only the map
     /// (insertion + Arc clone). Reads and writes against the inner
@@ -434,6 +442,14 @@ impl RunnerMetrics {
             .store(qs.price, Ordering::Relaxed);
     }
 
+    /// Publish the strategy's cumulative `Place`-actions count. Stored
+    /// atomically; the runner calls this on the same cadence as
+    /// [`Self::observe_quote_suppressions`] so the two numbers stay
+    /// comparable scrape-for-scrape.
+    pub fn observe_quotes_posted(&self, value: u64) {
+        self.quotes_posted.store(value, Ordering::Relaxed);
+    }
+
     /// Attach the market-data WebSocket's ping-RTT shared handle. Idempotent:
     /// subsequent calls with a different handle are ignored (the first
     /// wins) so wiring races during startup can't clobber a live handle.
@@ -606,6 +622,12 @@ impl RunnerMetrics {
             out,
             "ts_quote_suppressions_total{{reason=\"price\"}} {}",
             self.quote_suppressions_price.load(Ordering::Relaxed)
+        );
+        counter(
+            &mut out,
+            "ts_quotes_posted_total",
+            "Cumulative Place actions the strategy has emitted (the positive complement of ts_quote_suppressions_total).",
+            self.quotes_posted.load(Ordering::Relaxed),
         );
         encode_symbol_gauges(&mut out, &self.symbol_snapshot());
         out
@@ -1088,6 +1110,23 @@ mod tests {
         assert!(
             body.contains("ts_quote_suppressions_total{reason=\"price\"} 1"),
             "price series should reflect latest snapshot, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn quotes_posted_counter_reflects_observe_call() {
+        let m = RunnerMetrics::new();
+        let body0 = m.encode_prometheus();
+        assert!(
+            body0.contains("ts_quotes_posted_total 0"),
+            "expected 0 on startup, got:\n{body0}"
+        );
+
+        m.observe_quotes_posted(42);
+        let body = m.encode_prometheus();
+        assert!(
+            body.contains("ts_quotes_posted_total 42"),
+            "expected 42 after observe, got:\n{body}"
         );
     }
 

@@ -110,6 +110,17 @@ pub trait Strategy: Send {
     fn quote_suppressions(&self) -> QuoteSuppressions {
         QuoteSuppressions::default()
     }
+
+    /// Cumulative count of `Place` actions the strategy has emitted —
+    /// the positive complement of [`Self::quote_suppressions`]. Together
+    /// they describe every gate tick: either a quote went out, or one
+    /// of the gate reasons held it back. Monotonically non-decreasing,
+    /// zero on strategies that don't track their own output (the
+    /// runner's `orders_submitted` counter already covers the downstream
+    /// side). Surfaced as `ts_quotes_posted_total`.
+    fn quotes_posted(&self) -> u64 {
+        0
+    }
 }
 
 /// Forwarding impl so callers can own a strategy behind a trait object
@@ -135,6 +146,9 @@ impl Strategy for Box<dyn Strategy> {
     }
     fn quote_suppressions(&self) -> QuoteSuppressions {
         (**self).quote_suppressions()
+    }
+    fn quotes_posted(&self) -> u64 {
+        (**self).quotes_posted()
     }
 }
 

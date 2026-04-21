@@ -307,6 +307,10 @@ impl Strategy for InventorySkewMaker {
             price: self.counters.suppressed_price,
         }
     }
+
+    fn quotes_posted(&self) -> u64 {
+        self.counters.quotes_posted
+    }
 }
 
 #[cfg(test)]
