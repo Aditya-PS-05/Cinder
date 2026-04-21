@@ -178,6 +178,26 @@ pub struct LiveRunner<E: OrderEngine> {
     /// zero-cost empty map until the first observation — so callers
     /// don't need a feature gate.
     clock_skew_tracker: ClockSkewTracker,
+    /// Shared handle to the market-data WS client's cumulative
+    /// reconnect-resync counter (e.g.
+    /// [`ts_binance::SpotStreamClient::resync_counter`]). When attached,
+    /// every reconcile tick compares the counter against
+    /// [`Self::last_reconnect_seen`]; a strictly-greater value means
+    /// the WS client has resubscribed at least once since the last
+    /// observation, so the engine's cached order state is potentially
+    /// stale and we fire [`OrderEngine::resync_open_orders`] to bring
+    /// it back in sync. One resync fires per poll regardless of how
+    /// many reconnects happened between polls — we care about the
+    /// "dirty" bit, not the count.
+    reconnect_counter: Option<Arc<AtomicU64>>,
+    /// Last value observed from [`Self::reconnect_counter`]. Any poll
+    /// that sees a higher value triggers a resync and updates this
+    /// high-water mark. Seeded at build time from the counter's current
+    /// value so only reconnects that happen *after* the runner starts
+    /// trigger a resync — the engine has no cached state to rescue at
+    /// startup, so firing against the counter's startup value would be
+    /// pure waste.
+    last_reconnect_seen: u64,
 }
 
 /// Remote control for a [`LiveRunner`]. Dropping the handle does not
@@ -231,6 +251,7 @@ impl<E: OrderEngine> LiveRunner<E> {
             staleness_guard: None,
             clock_skew_guard: None,
             venue_error_guard: None,
+            reconnect_counter: None,
         }
     }
 
@@ -337,6 +358,7 @@ impl<E: OrderEngine> LiveRunner<E> {
                 }
                 _ = reconcile.tick() => {
                     self.drain_reconcile().await;
+                    self.maybe_reconnect_resync();
                 }
                 _ = async {
                     match timer_ticker.as_mut() {
@@ -889,6 +911,27 @@ impl<E: OrderEngine> LiveRunner<E> {
             }
         }
     }
+
+    /// Poll the attached WS reconnect counter and fire a resync when it
+    /// has advanced since the last poll. Called at the end of every
+    /// reconcile tick so the resync lands within one reconcile interval
+    /// of the reconnect event — tight enough that the engine's cached
+    /// state doesn't diverge for long, loose enough that a burst of
+    /// reconnects in the same tick only triggers one resync.
+    fn maybe_reconnect_resync(&mut self) {
+        let Some(counter) = self.reconnect_counter.as_ref() else {
+            return;
+        };
+        let current = counter.load(Ordering::Relaxed);
+        if current > self.last_reconnect_seen {
+            self.last_reconnect_seen = current;
+            self.engine.resync_open_orders();
+            self.summary.venue_resyncs += 1;
+            if let Some(m) = self.metrics.as_ref() {
+                m.observe_live(&self.summary);
+            }
+        }
+    }
 }
 
 pub struct LiveRunnerBuilder<E: OrderEngine> {
@@ -910,6 +953,7 @@ pub struct LiveRunnerBuilder<E: OrderEngine> {
     staleness_guard: Option<StalenessGuard>,
     clock_skew_guard: Option<ClockSkewGuard>,
     venue_error_guard: Option<VenueErrorGuard>,
+    reconnect_counter: Option<Arc<AtomicU64>>,
 }
 
 impl<E: OrderEngine> LiveRunnerBuilder<E> {
@@ -1039,6 +1083,22 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
         self
     }
 
+    /// Wire the market-data WS client's reconnect-resync counter (e.g.
+    /// [`ts_binance::SpotStreamClient::resync_counter`]) into the
+    /// runner. Each reconcile tick compares the counter against the
+    /// previously-observed value; a strict increase triggers
+    /// [`OrderEngine::resync_open_orders`] to reconcile the engine's
+    /// cached state against the venue's authoritative view, on the
+    /// assumption that a WS resubscribe may have dropped intervening
+    /// order updates. Complements
+    /// [`Self::resync_interval`](Self::resync_interval) which provides
+    /// a time-based safety net; this one fires on the actual failure
+    /// signal.
+    pub fn reconnect_resync_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.reconnect_counter = Some(counter);
+        self
+    }
+
     pub fn build(self) -> (LiveRunner<E>, LiveRunnerHandle) {
         let shutdown = Arc::new(Notify::new());
         let summary_tx = if self.summary_interval.is_zero() || self.summary_capacity == 0 {
@@ -1077,6 +1137,12 @@ impl<E: OrderEngine> LiveRunnerBuilder<E> {
             clock_skew_guard: self.clock_skew_guard,
             venue_error_guard: self.venue_error_guard,
             clock_skew_tracker: ClockSkewTracker::new(),
+            last_reconnect_seen: self
+                .reconnect_counter
+                .as_ref()
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            reconnect_counter: self.reconnect_counter,
         };
         (runner, handle)
     }
@@ -2567,5 +2633,63 @@ mod tests {
         let summary = task.await.unwrap();
 
         assert_eq!(summary.venue_resyncs, 0);
+    }
+
+    #[tokio::test]
+    async fn reconnect_counter_advance_triggers_resync() {
+        // Simulates a WS reconnect: bump the shared counter and confirm
+        // the runner's next reconcile tick picks up the edge and fires
+        // a resync (observable via summary.venue_resyncs).
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .reconnect_resync_counter(Arc::clone(&counter))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        // Let one reconcile tick run with the counter at 0 — no resync.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        counter.store(3, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert!(
+            summary.venue_resyncs >= 1,
+            "reconnect-counter edge must trigger at least one resync, got {}",
+            summary.venue_resyncs
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_counter_stable_triggers_no_resync() {
+        // Counter attached but never advanced — runner must never fire
+        // a resync, even across many reconcile ticks.
+        let api = QueuedApi::new(vec![]);
+        let engine = BinanceLiveEngine::new(Arc::clone(&api), specs(), venue(), 8);
+
+        let counter = Arc::new(AtomicU64::new(7));
+
+        let (_tx, rx) = mpsc::channel::<MarketEvent>(1);
+        let (runner, handle) = LiveRunner::builder(engine, maker(), rx)
+            .reconcile_interval(Duration::from_millis(10))
+            .reconnect_resync_counter(Arc::clone(&counter))
+            .build();
+        let task = tokio::spawn(runner.run());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        handle.shutdown();
+        let summary = task.await.unwrap();
+
+        assert_eq!(
+            summary.venue_resyncs, 0,
+            "no counter advance → no resync ticks"
+        );
     }
 }

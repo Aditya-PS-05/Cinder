@@ -353,12 +353,24 @@ async fn run(cfg: LiveCfg) -> Result<()> {
     let user_client = UserDataStreamClient::new(user_cfg, Arc::clone(&rest));
     let stream_illegal_counter = user_client.illegal_transitions_counter();
 
+    // Construct the market-data WS client up front so its
+    // reconnect-resync counter can be wired into the runner builder —
+    // the runner will fire `OrderEngine::resync_open_orders` on every
+    // reconcile tick that observes an advance in this counter, so a
+    // WS resubscribe triggers an authoritative-state refetch without
+    // waiting for the periodic resync timer.
+    let mut ws_cfg = SpotStreamConfig::new(vec![symbol_str.clone()], specs.clone());
+    ws_cfg.ws_url = cfg.market.ws_url.clone();
+    ws_cfg.rest_base = cfg.binance.rest_base.clone();
+    let md_client = Arc::new(SpotStreamClient::new(ws_cfg, Arc::clone(&bus)));
+
     let mut builder = LiveRunner::builder(engine, strategy, rx)
         .reconcile_interval(Duration::from_millis(cfg.binance.reconcile_ms))
         .risk_config(build_risk_config(
             cfg.risk.as_ref().and_then(|r| r.pre_trade.as_ref()),
         ))
-        .stream_illegal_counter(stream_illegal_counter);
+        .stream_illegal_counter(stream_illegal_counter)
+        .reconnect_resync_counter(md_client.resync_counter());
 
     let summary_interval = Duration::from_secs(cfg.runner.summary_secs);
     if !summary_interval.is_zero() {
@@ -459,10 +471,6 @@ async fn run(cfg: LiveCfg) -> Result<()> {
         })
     });
 
-    let mut ws_cfg = SpotStreamConfig::new(vec![symbol_str.clone()], specs.clone());
-    ws_cfg.ws_url = cfg.market.ws_url.clone();
-    ws_cfg.rest_base = cfg.binance.rest_base.clone();
-    let md_client = Arc::new(SpotStreamClient::new(ws_cfg, Arc::clone(&bus)));
     if let Some(m) = metrics_handle.as_ref() {
         m.attach_ws_ping_rtt(md_client.last_ping_rtt_handle());
         m.attach_ws_resync_counter(md_client.resync_counter());
