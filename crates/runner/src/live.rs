@@ -906,6 +906,7 @@ impl<E: OrderEngine> LiveRunner<E> {
     fn observe_metrics(&self) {
         if let Some(m) = self.metrics.as_ref() {
             m.observe_live(&self.summary);
+            m.observe_quote_suppressions(self.strategy.quote_suppressions());
             if let Some(ks) = self.kill_switch.as_ref() {
                 m.observe_kill_switch(ks);
             }

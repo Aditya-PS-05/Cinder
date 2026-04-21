@@ -26,6 +26,32 @@ pub enum StrategyAction {
     Cancel(ClientOrderId),
 }
 
+/// Per-reason snapshot of quotes the strategy suppressed rather than
+/// emitting. Cumulative counters, monotonically non-decreasing. Zero
+/// on strategies that have no suppression gates.
+///
+/// Surfaced by the runner as
+/// `ts_quote_suppressions_total{reason="cap|cross|price"}` so dashboards
+/// can distinguish "strategy is quiet because nothing is firing"
+/// (counters flat) from "strategy is quiet because a gate is holding
+/// it" (one of cap/cross/price advancing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuoteSuppressions {
+    /// Ticks where a side was dropped because inventory hit
+    /// `max_inventory` — the accumulating side is gated so the maker
+    /// doesn't compound a directional bet it's already caught in.
+    pub cap: u64,
+    /// Ticks where a side was dropped because its computed price would
+    /// cross the opposite top-of-book and take liquidity. Guarantees
+    /// the strategy stays a maker even if the spread math says
+    /// otherwise.
+    pub cross: u64,
+    /// Ticks where a side was dropped because its computed price was
+    /// non-positive — a numerical fallback for stacked widening /
+    /// inventory-skew math that underflowed.
+    pub price: u64,
+}
+
 /// Object-safe strategy contract.
 ///
 /// The orchestrator invokes [`Self::on_book_update`] every time the
@@ -75,6 +101,15 @@ pub trait Strategy: Send {
     fn on_shutdown(&mut self) -> Vec<StrategyAction> {
         Vec::new()
     }
+
+    /// Cumulative per-reason quote-suppression counters. Default
+    /// returns all-zero for strategies that don't gate quotes (e.g.
+    /// analytic-only or test doubles). Surfaced by the runner as
+    /// Prometheus counters so operators can distinguish a quiet
+    /// strategy from a gated one.
+    fn quote_suppressions(&self) -> QuoteSuppressions {
+        QuoteSuppressions::default()
+    }
 }
 
 /// Forwarding impl so callers can own a strategy behind a trait object
@@ -97,6 +132,9 @@ impl Strategy for Box<dyn Strategy> {
     }
     fn on_shutdown(&mut self) -> Vec<StrategyAction> {
         (**self).on_shutdown()
+    }
+    fn quote_suppressions(&self) -> QuoteSuppressions {
+        (**self).quote_suppressions()
     }
 }
 

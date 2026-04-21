@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use ts_core::{MarketEvent, Price, Symbol};
 use ts_replay::ReplaySummary;
 use ts_risk::KillSwitch;
+use ts_strategy::QuoteSuppressions;
 
 use crate::live::LiveSummary;
 
@@ -176,6 +177,23 @@ pub struct RunnerMetrics {
     /// until attached via [`Self::attach_ws_resync_counter`]. Surfaces
     /// as `spot_ws_resyncs_total` on every scrape.
     ws_resync_events: OnceLock<Arc<AtomicU64>>,
+
+    /// Cumulative quotes the strategy declined to emit because
+    /// inventory hit its cap. Sourced from
+    /// [`ts_strategy::Strategy::quote_suppressions`] on every
+    /// `observe_live` call. Surfaces as
+    /// `ts_quote_suppressions_total{reason="cap"}`.
+    quote_suppressions_cap: AtomicU64,
+    /// Same as [`Self::quote_suppressions_cap`] but for the cross-book
+    /// guard — the computed price would take liquidity and violate the
+    /// maker contract. Surfaces as
+    /// `ts_quote_suppressions_total{reason="cross"}`.
+    quote_suppressions_cross: AtomicU64,
+    /// Same as [`Self::quote_suppressions_cap`] but for the non-positive
+    /// price fallback — stacked widening / skew math underflowed and
+    /// the side was dropped. Surfaces as
+    /// `ts_quote_suppressions_total{reason="price"}`.
+    quote_suppressions_price: AtomicU64,
 
     /// Per-symbol PnL/position gauges. Lazily populated on first
     /// observation per symbol; the `Mutex` guards only the map
@@ -404,6 +422,18 @@ impl RunnerMetrics {
             .store(summary.venue_resyncs, Ordering::Relaxed);
     }
 
+    /// Publish a per-reason quote-suppression snapshot. Overwrites the
+    /// per-reason counters atomically, so readers always see a coherent
+    /// triple rather than a torn half-update. Called from the runner on
+    /// the same cadence as [`Self::observe_live`].
+    pub fn observe_quote_suppressions(&self, qs: QuoteSuppressions) {
+        self.quote_suppressions_cap.store(qs.cap, Ordering::Relaxed);
+        self.quote_suppressions_cross
+            .store(qs.cross, Ordering::Relaxed);
+        self.quote_suppressions_price
+            .store(qs.price, Ordering::Relaxed);
+    }
+
     /// Attach the market-data WebSocket's ping-RTT shared handle. Idempotent:
     /// subsequent calls with a different handle are ignored (the first
     /// wins) so wiring races during startup can't clobber a live handle.
@@ -557,6 +587,26 @@ impl RunnerMetrics {
                 h.load(Ordering::Relaxed),
             );
         }
+        let _ = writeln!(
+            out,
+            "# HELP ts_quote_suppressions_total Cumulative quotes the strategy declined to emit, split by gate reason (cap = inventory at limit, cross = would cross top-of-book, price = non-positive computed price)."
+        );
+        let _ = writeln!(out, "# TYPE ts_quote_suppressions_total counter");
+        let _ = writeln!(
+            out,
+            "ts_quote_suppressions_total{{reason=\"cap\"}} {}",
+            self.quote_suppressions_cap.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "ts_quote_suppressions_total{{reason=\"cross\"}} {}",
+            self.quote_suppressions_cross.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "ts_quote_suppressions_total{{reason=\"price\"}} {}",
+            self.quote_suppressions_price.load(Ordering::Relaxed)
+        );
         encode_symbol_gauges(&mut out, &self.symbol_snapshot());
         out
     }
@@ -999,6 +1049,45 @@ mod tests {
         assert!(
             body.contains("ts_venue_resyncs_total 4"),
             "expected 4 after observe_live, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn quote_suppressions_render_per_reason_labels() {
+        let m = RunnerMetrics::new();
+        // Zero on startup for all three series — scrape tooling never
+        // has to special-case "counter not initialised".
+        let body0 = m.encode_prometheus();
+        assert!(
+            body0.contains("ts_quote_suppressions_total{reason=\"cap\"} 0"),
+            "cap series missing on startup, got:\n{body0}"
+        );
+        assert!(
+            body0.contains("ts_quote_suppressions_total{reason=\"cross\"} 0"),
+            "cross series missing on startup, got:\n{body0}"
+        );
+        assert!(
+            body0.contains("ts_quote_suppressions_total{reason=\"price\"} 0"),
+            "price series missing on startup, got:\n{body0}"
+        );
+
+        m.observe_quote_suppressions(QuoteSuppressions {
+            cap: 7,
+            cross: 3,
+            price: 1,
+        });
+        let body = m.encode_prometheus();
+        assert!(
+            body.contains("ts_quote_suppressions_total{reason=\"cap\"} 7"),
+            "cap series should reflect latest snapshot, got:\n{body}"
+        );
+        assert!(
+            body.contains("ts_quote_suppressions_total{reason=\"cross\"} 3"),
+            "cross series should reflect latest snapshot, got:\n{body}"
+        );
+        assert!(
+            body.contains("ts_quote_suppressions_total{reason=\"price\"} 1"),
+            "price series should reflect latest snapshot, got:\n{body}"
         );
     }
 

@@ -16,7 +16,7 @@ use ts_core::{
     Timestamp, Venue,
 };
 
-use crate::{is_terminal, Strategy, StrategyAction};
+use crate::{is_terminal, QuoteSuppressions, Strategy, StrategyAction};
 
 /// Running counts of why the maker quoted (or didn't) on each tick.
 ///
@@ -298,6 +298,14 @@ impl Strategy for InventorySkewMaker {
             actions.push(StrategyAction::Cancel(cid));
         }
         actions
+    }
+
+    fn quote_suppressions(&self) -> QuoteSuppressions {
+        QuoteSuppressions {
+            cap: self.counters.suppressed_cap,
+            cross: self.counters.suppressed_cross,
+            price: self.counters.suppressed_price,
+        }
     }
 }
 
