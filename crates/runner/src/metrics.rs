@@ -162,6 +162,16 @@ pub struct RunnerMetrics {
     /// Surfaces as `ts_venue_resyncs_total`.
     venue_resyncs: AtomicU64,
 
+    /// Cumulative cancels fired by the kill-switch trip sweep against
+    /// cids that `Strategy::on_shutdown` failed to return but that the
+    /// engine still considered live. Sourced from
+    /// [`LiveSummary::trip_sweep_orphan_cancels`] on every `observe_live`
+    /// call. Non-zero indicates a strategy bug — the runner cleaned up,
+    /// but the strategy's shutdown path dropped live orders. Surfaces as
+    /// `ts_trip_sweep_orphan_cancels_total` so oncall can alert on the
+    /// counter advancing at all, not just on a threshold.
+    trip_sweep_orphan_cancels: AtomicU64,
+
     /// Optional shared handle to the market-data WebSocket's last-ping
     /// round-trip time in milliseconds
     /// (see [`ts_binance::SpotStreamClient::last_ping_rtt_handle`]).
@@ -428,6 +438,8 @@ impl RunnerMetrics {
         self.fills.store(summary.fills, Ordering::Relaxed);
         self.venue_resyncs
             .store(summary.venue_resyncs, Ordering::Relaxed);
+        self.trip_sweep_orphan_cancels
+            .store(summary.trip_sweep_orphan_cancels, Ordering::Relaxed);
     }
 
     /// Publish a per-reason quote-suppression snapshot. Overwrites the
@@ -586,6 +598,12 @@ impl RunnerMetrics {
             "ts_venue_resyncs_total",
             "LiveRunner periodic venue-state resync ticks (one per resync_interval firing).",
             self.venue_resyncs.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ts_trip_sweep_orphan_cancels_total",
+            "Cancels the kill-switch trip sweep fired against live cids the strategy's on_shutdown failed to return. Non-zero indicates a strategy-shutdown bug.",
+            self.trip_sweep_orphan_cancels.load(Ordering::Relaxed),
         );
         if let Some(h) = self.ws_ping_rtt_ms.get() {
             gauge(
@@ -1071,6 +1089,27 @@ mod tests {
         assert!(
             body.contains("ts_venue_resyncs_total 4"),
             "expected 4 after observe_live, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn trip_sweep_orphan_cancels_counter_tracks_live_summary() {
+        let m = RunnerMetrics::new();
+        let body0 = m.encode_prometheus();
+        assert!(
+            body0.contains("ts_trip_sweep_orphan_cancels_total 0"),
+            "expected 0 on startup, got:\n{body0}"
+        );
+
+        let summary = LiveSummary {
+            trip_sweep_orphan_cancels: 2,
+            ..Default::default()
+        };
+        m.observe_live(&summary);
+        let body = m.encode_prometheus();
+        assert!(
+            body.contains("ts_trip_sweep_orphan_cancels_total 2"),
+            "expected 2 after observe_live, got:\n{body}"
         );
     }
 
